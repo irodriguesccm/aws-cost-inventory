@@ -30,7 +30,7 @@ Siga os passos abaixo para executar o script no AWS CloudShell:
 No terminal do CloudShell, execute o comando abaixo para clonar este repositório:
 
 ```bash
-git clone https://github.com/irodriguesccm/aws-cost-inventory.git
+git clone https://github.com/irodriguesccm/aws_cost_inventory.git
 ```
 
 ### 3. Acesse o diretório do projeto
