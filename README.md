@@ -35,19 +35,27 @@ git clone https://github.com/irodriguesccm/aws-cost-inventory.git
 
 ### 3. Acesse o diretório do projeto
 Entre no diretório do projeto clonado
+```bash
 cd aws-inventory
+```
 
 ### 4. Instale as Dependências
 Instale as dependências necessárias utilizando o pip:
+```bash
 pip install -r requirements.txt
+```
 
 ### 5. Execute o Script
 Para iniciar a coleta do inventário, execute o seguinte comando:
+```bash
 python aws_cost_inventory.py
+```
 
 ### 6. Verifique o Resultado
 Após a execução, o script gerará um arquivo chamado aws_cost_inventory.json no diretório atual. Este arquivo contém o inventário completo dos recursos AWS.
 Para visualizar o conteúdo do arquivo, utilize o comando:
+```bash
 cat aws_cost_inventory.json | jq .
+```
 
 Nota: O jq já está pré-instalado no AWS CloudShell e facilita a visualização de arquivos JSON.
