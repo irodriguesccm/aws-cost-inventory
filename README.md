@@ -36,7 +36,7 @@ git clone https://github.com/irodriguesccm/aws-cost-inventory.git
 ### 3. Acesse o diretório do projeto
 Entre no diretório do projeto clonado
 ```bash
-cd aws-inventory
+cd aws-cost-inventory
 ```
 
 ### 4. Instale as Dependências
