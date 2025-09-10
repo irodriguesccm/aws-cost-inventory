@@ -59,3 +59,28 @@ cat aws_cost_inventory.json | jq .
 ```
 
 Nota: O jq já está pré-instalado no AWS CloudShell e facilita a visualização de arquivos JSON.
+
+### 7. Realize o Download do JSON
+Para baixar o arquivo JSON, execute o comando abaixo para verificar o diretório atual:
+```bash
+pwd
+```
+
+Será retornado algo como:
+/home/cloudshell-user/aws-cost-inventory
+
+Copie o diretório e execute o comando para obter o nome do arquivo JSON:
+```bash
+ls
+```
+
+Copie o nome do arquivo, será algo como:
+aws_cost_inventory.json
+
+Junte o ditetório atual + arquivo JSON conforme abaixo:
+/home/cloudshell-user/aws-cost-inventory/aws_cost_inventory.json
+
+Clique no botão “Actions” do CloudShell e em “Download file”.
+
+Cole o nome completo do repositório + arquvo JSON e realize o download:
+/home/cloudshell-user/aws-cost-inventory/aws_cost_inventory.json
