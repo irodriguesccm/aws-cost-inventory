@@ -29,7 +29,7 @@ class AWSCostInventory:
             return ['us-east-1', 'us-west-2', 'eu-west-1']  # fallback básico
     
     def list_ec2_instances(self):
-        """Listar instâncias EC2"""
+        """Listar instâncias EC2 com informações de storage"""
         instances = []
         regions = self.get_all_regions()
         
@@ -43,6 +43,24 @@ class AWSCostInventory:
                         # Obter tags para identificação
                         tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
                         
+                        # Obter volumes anexados
+                        volumes = []
+                        if 'BlockDeviceMappings' in instance:
+                            for mapping in instance['BlockDeviceMappings']:
+                                volume_id = mapping.get('Ebs', {}).get('VolumeId')
+                                if volume_id:
+                                    try:
+                                        volume_info = ec2.describe_volumes(VolumeIds=[volume_id])
+                                        volume = volume_info['Volumes'][0]
+                                        volumes.append({
+                                            'VolumeId': volume_id,
+                                            'Size': volume['Size'],
+                                            'VolumeType': volume['VolumeType'],
+                                            'Encrypted': volume['Encrypted']
+                                        })
+                                    except Exception as e:
+                                        self.log_error('ec2-volume', region, e)
+                        
                         instances.append({
                             'Region': region,
                             'InstanceId': instance['InstanceId'],
@@ -55,7 +73,8 @@ class AWSCostInventory:
                             'PublicIP': instance.get('PublicIpAddress'),
                             'PrivateIP': instance.get('PrivateIpAddress'),
                             'Name': tags.get('Name', 'N/A'),
-                            'Environment': tags.get('Environment', 'N/A')
+                            'Environment': tags.get('Environment', 'N/A'),
+                            'Volumes': volumes
                         })
             except Exception as e:
                 self.log_error('ec2', region, e)
