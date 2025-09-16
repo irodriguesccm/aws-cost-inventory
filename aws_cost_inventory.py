@@ -506,7 +506,7 @@ class AWSCostInventory:
         all_results = []
         failed_regions = []
         
-        print(f"🔄 Processando {service_name} em {len(regions)} regiões (workers: {max_workers})...")
+        print(f" Processando {service_name} em {len(regions)} regiões (workers: {max_workers})...")
         
         def process_single_region(region):
             try:
