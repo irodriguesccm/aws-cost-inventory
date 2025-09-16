@@ -1,390 +1,334 @@
 import boto3
 import json
 from datetime import datetime, timedelta
-from botocore.exceptions import ClientError, NoCredentialsError, ReadTimeoutError, ConnectTimeoutError
+from botocore.exceptions import ClientError, NoCredentialsError
 from botocore.config import Config
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+import threading
 
 class AWSCostInventory:
     def __init__(self):
         self.inventory = {}
         self.errors = []
+        self.cancelled = False
+        self.start_time = time.time()
         
-        # Configuração de timeouts para evitar travamentos
-        self.config = {
-            'region_name': 'us-east-1',
-            'retries': {
-                'max_attempts': 3,
+        # Configuração otimizada para APIs AWS
+        self.config = Config(
+            region_name='us-east-1',
+            retries={
+                'max_attempts': 2,  # Reduzido para evitar travamentos
                 'mode': 'adaptive'
             },
-            'read_timeout': 30,      # 30 segundos para operações de leitura
-            'connect_timeout': 10    # 10 segundos para conexão
-        }
+            read_timeout=30,  # Timeout de leitura de 30 segundos
+            connect_timeout=10,  # Timeout de conexão de 10 segundos
+            max_pool_connections=10
+        )
         
-        # Limites para evitar travamentos em buckets grandes
-        self.s3_max_objects = 10000  # Máximo de objetos a listar por bucket
-        self.s3_timeout = 60         # Timeout específico para operações S3
+        # Regiões prioritárias para evitar timeouts desnecessários
+        self.priority_regions = [
+            'us-east-1', 'us-west-2', 'eu-west-1', 'eu-central-1',
+            'ap-southeast-1', 'ap-northeast-1'
+        ]
         
-        print(f"🔧 Configurações de timeout definidas:")
-        print(f"   • Timeout de leitura: {self.config['read_timeout']}s")
-        print(f"   • Timeout de conexão: {self.config['connect_timeout']}s")
-        print(f"   • Limite S3: {self.s3_max_objects} objetos por bucket")
+        # Configurar handler para cancelamento
+        signal.signal(signal.SIGINT, self.signal_handler)
         
-    def get_boto3_client(self, service, region=None):
-        """Criar cliente boto3 com configurações otimizadas"""
-        try:
-            config_dict = self.config.copy()
-            if region:
-                config_dict['region_name'] = region
-                
-            return boto3.client(service, **config_dict)
-        except Exception as e:
-            # Fallback sem configurações avançadas se houver erro
-            return boto3.client(service, region_name=region or 'us-east-1')
+    def signal_handler(self, signum, frame):
+        """Handler para cancelamento via Ctrl+C"""
+        print("\n⚠️ Recebido sinal de cancelamento. Finalizando operações...")
+        self.cancelled = True
+        
+    def is_cancelled(self):
+        """Verificar se a operação foi cancelada"""
+        return self.cancelled
+        
+    def get_elapsed_time(self):
+        """Obter tempo decorrido em segundos"""
+        return time.time() - self.start_time
         
     def log_error(self, service, region, error):
         """Log de erros para análise posterior"""
-        error_info = {
+        self.errors.append({
             "service": service,
             "region": region,
             "error": str(error),
-            "error_type": type(error).__name__,
             "timestamp": datetime.utcnow().isoformat()
-        }
-        self.errors.append(error_info)
-        
-        # Log imediato para debug
-        print(f"⚠️ Erro em {service} ({region}): {str(error)[:100]}...")
+        })
     
     def get_all_regions(self):
         """Obter todas as regiões AWS disponíveis com timeout"""
         try:
-            print("🌍 Obtendo lista de regiões AWS...")
-            ec2 = self.get_boto3_client('ec2', 'us-east-1')
+            ec2 = boto3.client('ec2', region_name='us-east-1', config=self.config)
+            response = ec2.describe_regions()
+            all_regions = [r['RegionName'] for r in response['Regions']]
             
-            # Implementar timeout manual
-            start_time = time.time()
-            regions_response = ec2.describe_regions()
+            # Priorizar regiões mais comuns para evitar timeouts em regiões menos utilizadas
+            prioritized = []
+            for region in self.priority_regions:
+                if region in all_regions:
+                    prioritized.append(region)
             
-            if time.time() - start_time > 15:  # Se demorou mais de 15 segundos
-                print("⚠️ Consulta de regiões demorou muito, usando lista padrão")
-                return ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-southeast-1']
-                
-            regions = [r['RegionName'] for r in regions_response['Regions']]
-            print(f"✅ Encontradas {len(regions)} regiões")
-            return regions
+            # Adicionar outras regiões após as prioritárias
+            for region in all_regions:
+                if region not in prioritized:
+                    prioritized.append(region)
+                    
+            print(f"🌍 Encontradas {len(prioritized)} regiões ({len(self.priority_regions)} prioritárias)")
+            return prioritized[:12]  # Limitar a 12 regiões para evitar timeouts
             
-        except (ReadTimeoutError, ConnectTimeoutError) as e:
-            print(f"⚠️ Timeout ao obter regiões: {str(e)}")
-            self.log_error('ec2', 'global', e)
-            return ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-southeast-1']
         except Exception as e:
             self.log_error('ec2', 'global', e)
-            return ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-southeast-1']  # fallback básico
+            print("⚠️ Erro ao obter regiões, usando fallback básico")
+            return self.priority_regions  # fallback com regiões prioritárias
     
     def list_ec2_instances(self):
-        """Listar instâncias EC2 com informações de storage usando processamento paralelo"""
-        print("🖥️ Coletando instâncias EC2 de todas as regiões...")
+        """Listar instâncias EC2 com informações de storage - versão otimizada"""
         instances = []
         regions = self.get_all_regions()
         
-        # Processamento paralelo por região
-        def process_region_ec2(region):
-            region_instances = []
-            try:
-                print(f"   🌍 Processando EC2 em {region}...")
-                ec2 = self.get_boto3_client('ec2', region)
-                
-                start_time = time.time()
-                response = ec2.describe_instances()
-                
-                if time.time() - start_time > 30:  # Timeout por região
-                    print(f"   ⚠️ Timeout em EC2 {region}")
-                    return region_instances
-                
-                for reservation in response['Reservations']:
-                    for instance in reservation['Instances']:
-                        # Obter tags para identificação
-                        tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
-                        
-                        # Obter volumes anexados
-                        volumes = []
-                        if 'BlockDeviceMappings' in instance:
-                            for mapping in instance['BlockDeviceMappings']:
-                                volume_id = mapping.get('Ebs', {}).get('VolumeId')
-                                if volume_id:
-                                    try:
-                                        volume_info = ec2.describe_volumes(VolumeIds=[volume_id])
-                                        volume = volume_info['Volumes'][0]
-                                        volumes.append({
-                                            'VolumeId': volume_id,
-                                            'Size': volume['Size'],
-                                            'VolumeType': volume['VolumeType'],
-                                            'Encrypted': volume['Encrypted']
-                                        })
-                                    except Exception as e:
-                                        self.log_error('ec2-volume', region, e)
-                        
-                        region_instances.append({
-                            'Region': region,
-                            'InstanceId': instance['InstanceId'],
-                            'InstanceType': instance['InstanceType'],
-                            'State': instance['State']['Name'],
-                            'LaunchTime': instance.get('LaunchTime', '').isoformat() if instance.get('LaunchTime') else None,
-                            'Platform': instance.get('Platform', 'Linux'),
-                            'VPC': instance.get('VpcId'),
-                            'SubnetId': instance.get('SubnetId'),
-                            'PublicIP': instance.get('PublicIpAddress'),
-                            'PrivateIP': instance.get('PrivateIpAddress'),
-                            'Name': tags.get('Name', 'N/A'),
-                            'Environment': tags.get('Environment', 'N/A'),
-                            'Volumes': volumes
-                        })
-                        
-                print(f"   ✅ EC2 {region}: {len(region_instances)} instâncias")
-                        
-            except Exception as e:
-                print(f"   ❌ Erro EC2 {region}: {str(e)[:50]}...")
-                self.log_error('ec2', region, e)
-            
-            return region_instances
+        print(f"🖥️ Consultando instâncias EC2 em {len(regions)} regiões...")
         
-        # Executar em paralelo com limite de threads
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_region = {executor.submit(process_region_ec2, region): region for region in regions}
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_region = {
+                executor.submit(self.get_ec2_instances_by_region, region): region 
+                for region in regions
+            }
             
-            for future in as_completed(future_to_region, timeout=300):  # 5 minutos máximo
+            for future in as_completed(future_to_region, timeout=180):
+                if self.is_cancelled():
+                    break
+                    
+                region = future_to_region[future]
                 try:
-                    region_instances = future.result()
+                    region_instances = future.result(timeout=30)
                     instances.extend(region_instances)
+                    if region_instances:
+                        print(f"   ✅ {region}: {len(region_instances)} instâncias")
                 except Exception as e:
-                    region = future_to_region[future]
-                    print(f"   ❌ Falha na thread EC2 {region}: {str(e)}")
+                    print(f"   ❌ {region}: {str(e)[:50]}")
+                    self.log_error('ec2', region, e)
         
-        print(f"✅ EC2 concluído: {len(instances)} instâncias encontradas")
         return instances
-    
-    def list_ebs_volumes(self):
-        """Listar volumes EBS usando processamento paralelo"""
-        print("💾 Coletando volumes EBS de todas as regiões...")
-        volumes = []
+
+    def get_ec2_instances_by_region(self, region):
+        """Obter instâncias EC2 de uma região específica"""
+        instances = []
+        try:
+            ec2 = boto3.client('ec2', region_name=region, config=self.config)
+            response = ec2.describe_instances()
+            
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    if self.is_cancelled():
+                        break
+                        
+                    tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                    
+                    # Obter volumes de forma otimizada
+                    volumes = []
+                    if 'BlockDeviceMappings' in instance:
+                        volume_ids = [
+                            mapping.get('Ebs', {}).get('VolumeId') 
+                            for mapping in instance['BlockDeviceMappings'] 
+                            if mapping.get('Ebs', {}).get('VolumeId')
+                        ]
+                        
+                        if volume_ids:
+                            try:
+                                volume_info = ec2.describe_volumes(VolumeIds=volume_ids)
+                                for volume in volume_info['Volumes']:
+                                    volumes.append({
+                                        'VolumeId': volume['VolumeId'],
+                                        'Size': volume['Size'],
+                                        'VolumeType': volume['VolumeType'],
+                                        'Encrypted': volume['Encrypted']
+                                    })
+                            except Exception:
+                                pass  # Ignorar erros de volumes para não travar
+                    
+                    instances.append({
+                        'Region': region,
+                        'InstanceId': instance['InstanceId'],
+                        'InstanceType': instance['InstanceType'],
+                        'State': instance['State']['Name'],
+                        'LaunchTime': instance.get('LaunchTime', '').isoformat() if instance.get('LaunchTime') else None,
+                        'Platform': instance.get('Platform', 'Linux'),
+                        'VPC': instance.get('VpcId'),
+                        'SubnetId': instance.get('SubnetId'),
+                        'PublicIP': instance.get('PublicIpAddress'),
+                        'PrivateIP': instance.get('PrivateIpAddress'),
+                        'Name': tags.get('Name', 'N/A'),
+                        'Environment': tags.get('Environment', 'N/A'),
+                        'Volumes': volumes
+                    })
+        except Exception as e:
+            self.log_error('ec2', region, e)
+        
+        return instances
+
+    def parallel_region_query(self, service_name, query_function, max_workers=3, timeout=120):
+        """Executar consultas em paralelo por região com timeout"""
+        results = []
         regions = self.get_all_regions()
         
-        def process_region_ebs(region):
-            region_volumes = []
-            try:
-                print(f"   🌍 Processando EBS em {region}...")
-                ec2 = self.get_boto3_client('ec2', region)
-                
-                start_time = time.time()
-                response = ec2.describe_volumes()
-                
-                if time.time() - start_time > 30:
-                    print(f"   ⚠️ Timeout em EBS {region}")
-                    return region_volumes
-                
-                for volume in response['Volumes']:
-                    tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
-                    
-                    region_volumes.append({
-                        'Region': region,
-                        'VolumeId': volume['VolumeId'],
-                        'Size': volume['Size'],
-                        'VolumeType': volume['VolumeType'],
-                        'State': volume['State'],
-                        'AvailabilityZone': volume['AvailabilityZone'],
-                        'Encrypted': volume['Encrypted'],
-                        'AttachedInstance': volume['Attachments'][0]['InstanceId'] if volume['Attachments'] else None,
-                        'IOPS': volume.get('Iops', 0),
-                        'Name': tags.get('Name', 'N/A')
-                    })
-                
-                print(f"   ✅ EBS {region}: {len(region_volumes)} volumes")
-                    
-            except Exception as e:
-                print(f"   ❌ Erro EBS {region}: {str(e)[:50]}...")
-                self.log_error('ebs', region, e)
-            
-            return region_volumes
+        print(f"🔍 Consultando {service_name} em {len(regions)} regiões...")
         
-        # Processamento paralelo
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_region = {executor.submit(process_region_ebs, region): region for region in regions}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_region = {
+                executor.submit(query_function, region): region 
+                for region in regions
+            }
             
-            for future in as_completed(future_to_region, timeout=200):
+            completed_count = 0
+            for future in as_completed(future_to_region, timeout=timeout):
+                if self.is_cancelled():
+                    print(f"⚠️ {service_name}: Cancelado pelo usuário")
+                    break
+                    
+                region = future_to_region[future]
+                completed_count += 1
+                
                 try:
-                    region_volumes = future.result()
-                    volumes.extend(region_volumes)
+                    region_results = future.result(timeout=20)  # 20 segundos por região
+                    results.extend(region_results)
+                    
+                    status = f"({completed_count}/{len(regions)})"
+                    if region_results:
+                        print(f"   ✅ {region} {status}: {len(region_results)} recursos")
+                    
                 except Exception as e:
-                    region = future_to_region[future]
-                    print(f"   ❌ Falha na thread EBS {region}: {str(e)}")
+                    print(f"   ❌ {region} ({completed_count}/{len(regions)}): {str(e)[:50]}")
+                    self.log_error(service_name, region, e)
         
-        print(f"✅ EBS concluído: {len(volumes)} volumes encontrados")
+        return results
+    
+    def list_ebs_volumes(self):
+        """Listar volumes EBS - versão otimizada"""
+        return self.parallel_region_query('EBS', self.get_ebs_volumes_by_region)
+
+    def get_ebs_volumes_by_region(self, region):
+        """Obter volumes EBS de uma região específica"""
+        volumes = []
+        try:
+            ec2 = boto3.client('ec2', region_name=region, config=self.config)
+            response = ec2.describe_volumes()
+            
+            for volume in response['Volumes']:
+                if self.is_cancelled():
+                    break
+                    
+                tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
+                
+                volumes.append({
+                    'Region': region,
+                    'VolumeId': volume['VolumeId'],
+                    'Size': volume['Size'],
+                    'VolumeType': volume['VolumeType'],
+                    'State': volume['State'],
+                    'AvailabilityZone': volume['AvailabilityZone'],
+                    'Encrypted': volume['Encrypted'],
+                    'AttachedInstance': volume['Attachments'][0]['InstanceId'] if volume['Attachments'] else None,
+                    'IOPS': volume.get('Iops', 0),
+                    'Name': tags.get('Name', 'N/A')
+                })
+        except Exception as e:
+            pass  # Erro já será logado pelo método pai
+        
         return volumes
     
     def list_s3_buckets(self):
-        """Listar buckets S3 com tamanhos usando múltiplas estratégias otimizadas"""
+        """Listar buckets S3 com timeout otimizado e paginação controlada"""
         buckets = []
         try:
-            print("🪣 Iniciando análise de buckets S3...")
-            s3 = self.get_boto3_client('s3')
-            
-            start_time = time.time()
+            s3 = boto3.client('s3', config=self.config)
             response = s3.list_buckets()
             
-            total_buckets = len(response['Buckets'])
-            print(f"📦 Encontrados {total_buckets} buckets")
+            print(f"🪣 Encontrados {len(response['Buckets'])} buckets S3")
             
-            for i, bucket in enumerate(response['Buckets'], 1):
-                bucket_name = bucket['Name']
-                print(f"🔍 [{i}/{total_buckets}] Analisando bucket: {bucket_name}")
+            # Usar ThreadPoolExecutor para processar buckets em paralelo com timeout
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                future_to_bucket = {}
                 
-                # Timeout por bucket individual
-                bucket_start = time.time()
+                for bucket in response['Buckets']:
+                    if self.is_cancelled():
+                        break
+                        
+                    bucket_name = bucket['Name']
+                    future = executor.submit(self.get_bucket_info_safe, bucket_name, bucket)
+                    future_to_bucket[future] = bucket_name
                 
-                # Obter região do bucket com timeout
-                bucket_region = self.get_bucket_region_safe(bucket_name, s3)
-                
-                # Múltiplas estratégias para obter o tamanho com timeout
-                size_info = self.get_bucket_size_optimized(bucket_name, bucket_region)
-                
-                bucket_time = time.time() - bucket_start
-                print(f"   ⏱️ Processado em {bucket_time:.1f}s")
-                
-                buckets.append({
-                    'BucketName': bucket_name,
-                    'Region': bucket_region,
-                    'CreationDate': bucket['CreationDate'].isoformat(),
-                    'Size': size_info['formatted_size'],
-                    'ObjectCount': size_info['object_count'],
-                    'SizeBytes': size_info['size_bytes'],
-                    'ProcessingTime': f"{bucket_time:.1f}s"
-                })
-                
-                # Se já demorou muito no total, parar
-                total_time = time.time() - start_time
-                if total_time > 300:  # 5 minutos máximo para todos os buckets
-                    print(f"⚠️ Timeout geral de S3 atingido ({total_time:.1f}s). Parando análise.")
-                    break
-                
+                # Processar resultados com timeout
+                for future in as_completed(future_to_bucket, timeout=300):  # 5 minutos total
+                    if self.is_cancelled():
+                        break
+                        
+                    try:
+                        bucket_info = future.result(timeout=45)  # 45 segundos por bucket
+                        if bucket_info:
+                            buckets.append(bucket_info)
+                    except Exception as e:
+                        bucket_name = future_to_bucket[future]
+                        print(f"❌ Timeout/Erro no bucket {bucket_name}: {str(e)[:100]}")
+                        self.log_error('s3-bucket-timeout', bucket_name, e)
+                        
+                        # Adicionar bucket com informações básicas
+                        buckets.append({
+                            'BucketName': bucket_name,
+                            'Region': 'unknown',
+                            'CreationDate': bucket['CreationDate'].isoformat(),
+                            'Size': 'Timeout - não calculado',
+                            'ObjectCount': 'N/A',
+                            'SizeBytes': 0
+                        })
+                        
         except Exception as e:
+            print(f"❌ Erro geral ao listar buckets S3: {e}")
             self.log_error('s3', 'global', e)
         
-        print(f"✅ Análise de S3 concluída: {len(buckets)} buckets processados")
         return buckets
-    
-    def get_bucket_region_safe(self, bucket_name, s3_client):
-        """Obter região do bucket com tratamento seguro"""
-        try:
-            start_time = time.time()
-            response = s3_client.get_bucket_location(Bucket=bucket_name)
-            
-            if time.time() - start_time > 10:  # Se demorou mais de 10 segundos
-                print(f"   ⚠️ Timeout ao obter região do bucket {bucket_name}")
-                return 'unknown'
-                
-            bucket_region = response['LocationConstraint']
-            if bucket_region is None:
-                bucket_region = 'us-east-1'
-            return bucket_region
-        except Exception as e:
-            print(f"   ⚠️ Erro ao obter região: {str(e)[:50]}...")
-            return 'unknown'
 
-    def get_bucket_size_optimized(self, bucket_name, bucket_region):
-        """Obter tamanho do bucket usando estratégias otimizadas com timeouts"""
-        size_info = {
-            'size_bytes': 0,
-            'object_count': 0,
-            'formatted_size': 'N/A'
-        }
-        
-        bucket_start = time.time()
-        max_bucket_time = 60  # Máximo 60 segundos por bucket
-        
+    def get_bucket_info_safe(self, bucket_name, bucket_data):
+        """Obter informações do bucket com timeout e fallbacks rápidos"""
         try:
-            s3 = self.get_boto3_client('s3')
+            print(f"🔍 Analisando bucket: {bucket_name}")
             
-            print(f"   📋 Listando objetos (limite: {self.s3_max_objects})...")
+            s3 = boto3.client('s3', config=self.config)
             
-            # Estratégia otimizada: usar head_object para verificar se bucket tem conteúdo
+            # Obter região do bucket com timeout
             try:
-                # Tentar listar apenas o primeiro objeto para verificar se bucket está vazio
-                response = s3.list_objects_v2(Bucket=bucket_name, MaxKeys=1)
-                
-                if 'Contents' not in response:
-                    # Bucket vazio
-                    size_info['formatted_size'] = "0 B (Bucket vazio)"
-                    print(f"   📭 Bucket {bucket_name} está vazio")
-                    return size_info
-                
-            except Exception as first_check_error:
-                print(f"   ⚠️ Erro na verificação inicial: {str(first_check_error)[:50]}...")
-                # Se não conseguir nem verificar se está vazio, tentar CloudWatch
-                return self.get_bucket_size_from_cloudwatch(bucket_name, bucket_region)
+                bucket_region = s3.get_bucket_location(Bucket=bucket_name)['LocationConstraint']
+                if bucket_region is None:
+                    bucket_region = 'us-east-1'
+            except:
+                bucket_region = 'unknown'
             
-            # Se chegou aqui, bucket tem conteúdo - tentar listar com limite
-            print(f"   � Contando objetos (timeout: {max_bucket_time}s)...")
+            # Estratégia rápida: tentar CloudWatch primeiro
+            size_info = self.get_bucket_size_cloudwatch(bucket_name, bucket_region)
             
-            paginator = s3.get_paginator('list_objects_v2')
-            page_iterator = paginator.paginate(
-                Bucket=bucket_name,
-                PaginationConfig={'MaxItems': self.s3_max_objects}
-            )
+            # Se CloudWatch falhar, tentar listagem limitada
+            if size_info['size_bytes'] == 0 and size_info['formatted_size'] == 'N/A':
+                size_info = self.get_bucket_size_limited(bucket_name)
             
-            total_size = 0
-            total_count = 0
-            
-            try:
-                for page_num, page in enumerate(page_iterator, 1):
-                    # Verificar timeout
-                    if time.time() - bucket_start > max_bucket_time:
-                        print(f"   ⏰ Timeout atingido após {page_num} páginas")
-                        break
-                    
-                    if 'Contents' in page:
-                        page_objects = len(page['Contents'])
-                        total_count += page_objects
-                        
-                        for obj in page['Contents']:
-                            total_size += obj['Size']
-                        
-                        # Mostrar progresso a cada 10 páginas ou 1000 objetos
-                        if page_num % 10 == 0 or total_count >= 1000:
-                            print(f"   🔄 Página {page_num}: {total_count} objetos, {self.format_bytes(total_size)}")
-                    
-                    # Parar se atingiu o limite de objetos
-                    if total_count >= self.s3_max_objects:
-                        print(f"   ⚠️ Limite de {self.s3_max_objects} objetos atingido")
-                        size_info['formatted_size'] += " (limitado)"
-                        break
-                
-                size_info['size_bytes'] = total_size
-                size_info['object_count'] = total_count
-                size_info['formatted_size'] = self.format_bytes(total_size)
-                
-                if total_count >= self.s3_max_objects:
-                    size_info['formatted_size'] += " (aproximado)"
-                
-                print(f"   ✅ Bucket {bucket_name}: {size_info['formatted_size']} ({total_count} objetos)")
-                return size_info
-                
-            except Exception as list_error:
-                print(f"   ⚠️ Erro ao listar objetos: {str(list_error)[:50]}...")
-                # Fallback para CloudWatch
-                return self.get_bucket_size_from_cloudwatch(bucket_name, bucket_region)
+            return {
+                'BucketName': bucket_name,
+                'Region': bucket_region,
+                'CreationDate': bucket_data['CreationDate'].isoformat(),
+                'Size': size_info['formatted_size'],
+                'ObjectCount': size_info['object_count'],
+                'SizeBytes': size_info['size_bytes']
+            }
             
         except Exception as e:
-            print(f"   ❌ Erro geral no bucket: {str(e)[:50]}...")
-            self.log_error('s3-bucket-size', bucket_name, e)
-            size_info['formatted_size'] = "Erro ao obter tamanho"
-            return size_info
-    
-    def get_bucket_size_from_cloudwatch(self, bucket_name, bucket_region):
-        """Fallback: obter tamanho via CloudWatch"""
+            print(f"⚠️ Erro ao processar bucket {bucket_name}: {str(e)[:100]}")
+            self.log_error('s3-bucket-process', bucket_name, e)
+            return None
+
+    def get_bucket_size_cloudwatch(self, bucket_name, bucket_region):
+        """Tentar obter tamanho via CloudWatch (mais rápido)"""
         size_info = {
             'size_bytes': 0,
             'object_count': 0,
@@ -392,14 +336,14 @@ class AWSCostInventory:
         }
         
         try:
-            print(f"   🔄 Tentando CloudWatch para {bucket_name}...")
-            cw_region = 'us-east-1' if bucket_region in ['us-east-1', 'unknown'] else bucket_region
-            cw = self.get_boto3_client('cloudwatch', cw_region)
+            cw_region = 'us-east-1' if bucket_region == 'us-east-1' else bucket_region
+            cw = boto3.client('cloudwatch', region_name=cw_region, config=self.config)
             
-            # Timeout para CloudWatch
-            cw_start = time.time()
+            # Métricas dos últimos 3 dias (mais rápido que 7 dias)
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=3)
             
-            # Tentar obter métricas dos últimos 7 dias
+            # Obter tamanho
             metric = cw.get_metric_statistics(
                 Namespace='AWS/S3',
                 MetricName='BucketSizeBytes',
@@ -407,25 +351,18 @@ class AWSCostInventory:
                     {'Name': 'BucketName', 'Value': bucket_name},
                     {'Name': 'StorageType', 'Value': 'StandardStorage'}
                 ],
-                StartTime=datetime.utcnow() - timedelta(days=7),
-                EndTime=datetime.utcnow(),
+                StartTime=start_time,
+                EndTime=end_time,
                 Period=86400,
                 Statistics=['Average']
             )
             
-            # Verificar se CloudWatch demorou muito
-            if time.time() - cw_start > 20:
-                print(f"   ⚠️ CloudWatch demorou muito para {bucket_name}")
-                size_info['formatted_size'] = "Timeout CloudWatch"
-                return size_info
-            
             if metric['Datapoints']:
                 size_bytes = metric['Datapoints'][-1]['Average']
                 size_info['size_bytes'] = size_bytes
-                size_info['formatted_size'] = self.format_bytes(size_bytes) + " (CloudWatch)"
-            
-            # Tentar obter contagem de objetos
-            try:
+                size_info['formatted_size'] = self.format_size(size_bytes)
+                
+                # Tentar obter contagem de objetos
                 count_metric = cw.get_metric_statistics(
                     Namespace='AWS/S3',
                     MetricName='NumberOfObjects',
@@ -433,134 +370,145 @@ class AWSCostInventory:
                         {'Name': 'BucketName', 'Value': bucket_name},
                         {'Name': 'StorageType', 'Value': 'AllStorageTypes'}
                     ],
-                    StartTime=datetime.utcnow() - timedelta(days=7),
-                    EndTime=datetime.utcnow(),
+                    StartTime=start_time,
+                    EndTime=end_time,
                     Period=86400,
                     Statistics=['Average']
                 )
                 
                 if count_metric['Datapoints']:
                     size_info['object_count'] = int(count_metric['Datapoints'][-1]['Average'])
-                    
-            except:
-                pass  # Não conseguiu obter contagem, mas tudo bem
+                
+                print(f"   ✅ CloudWatch {bucket_name}: {size_info['formatted_size']}")
             
-            if size_info['formatted_size'] == 'N/A':
-                size_info['formatted_size'] = "Sem dados CloudWatch"
+        except Exception as e:
+            print(f"   ⚠️ CloudWatch falhou para {bucket_name}: {str(e)[:50]}")
+        
+        return size_info
+
+    def get_bucket_size_limited(self, bucket_name):
+        """Obter tamanho via listagem limitada (fallback)"""
+        size_info = {
+            'size_bytes': 0,
+            'object_count': 0,
+            'formatted_size': 'N/A'
+        }
+        
+        try:
+            print(f"   📋 Listagem limitada para {bucket_name}...")
+            s3 = boto3.client('s3', config=self.config)
             
-            print(f"   ✅ CloudWatch {bucket_name}: {size_info['formatted_size']}")
+            paginator = s3.get_paginator('list_objects_v2')
+            page_iterator = paginator.paginate(
+                Bucket=bucket_name,
+                PaginationConfig={
+                    'MaxItems': 1000,  # Limitar a 1000 objetos para evitar timeout
+                    'PageSize': 100
+                }
+            )
+            
+            total_size = 0
+            total_count = 0
+            pages_processed = 0
+            max_pages = 10  # Máximo 10 páginas para evitar timeout
+            
+            for page in page_iterator:
+                if self.is_cancelled() or pages_processed >= max_pages:
+                    size_info['formatted_size'] += " (limitado)"
+                    break
                     
-        except Exception as cw_error:
-            print(f"   ❌ Erro no CloudWatch: {str(cw_error)[:50]}...")
-            self.log_error('cloudwatch-s3', bucket_region, cw_error)
-            size_info['formatted_size'] = "Erro CloudWatch"
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        total_size += obj['Size']
+                        total_count += 1
+                
+                pages_processed += 1
+            
+            size_info['size_bytes'] = total_size
+            size_info['object_count'] = total_count
+            size_info['formatted_size'] = self.format_size(total_size)
+            
+            if pages_processed >= max_pages:
+                size_info['formatted_size'] += " (estimativa)"
+            
+            print(f"   ✅ Listagem {bucket_name}: {size_info['formatted_size']} ({total_count}+ objetos)")
+            
+        except Exception as e:
+            print(f"   ❌ Listagem falhou para {bucket_name}: {str(e)[:50]}")
+            size_info['formatted_size'] = "Erro ao calcular"
         
         return size_info
     
-    def format_bytes(self, bytes_size):
-        """Formatar bytes em formato legível"""
-        if bytes_size == 0:
-            return "0 B"
-        elif bytes_size < 1024:
-            return f"{bytes_size:.0f} B"
-        elif bytes_size < 1024**2:
-            return f"{bytes_size/1024:.2f} KB"
-        elif bytes_size < 1024**3:
-            return f"{bytes_size/(1024**2):.2f} MB"
-        elif bytes_size < 1024**4:
-            return f"{bytes_size/(1024**3):.2f} GB"
+    def format_size(self, size_bytes):
+        """Formatar tamanho em bytes para formato legível"""
+        if size_bytes == 0:
+            return "0 B (vazio)"
+        elif size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024**2:
+            return f"{size_bytes/1024:.2f} KB"
+        elif size_bytes < 1024**3:
+            return f"{size_bytes/(1024**2):.2f} MB"
+        elif size_bytes < 1024**4:
+            return f"{size_bytes/(1024**3):.2f} GB"
         else:
-            return f"{bytes_size/(1024**4):.2f} TB"
+            return f"{size_bytes/(1024**4):.2f} TB"
     
     def list_rds_instances(self):
-        """Listar instâncias RDS com tratamento robusto de erros"""
-        print("🗄️ Coletando instâncias RDS...")
+        """Listar instâncias RDS - versão otimizada"""
+        return self.parallel_region_query('RDS', self.get_rds_instances_by_region)
+
+    def get_rds_instances_by_region(self, region):
+        """Obter instâncias RDS de uma região específica"""
         rds_instances = []
-        regions = self.get_all_regions()
-        
-        def process_region_rds(region):
-            region_instances = []
+        try:
+            rds = boto3.client('rds', region_name=region, config=self.config)
+            
+            # RDS Instances
+            instances = rds.describe_db_instances()
+            for instance in instances['DBInstances']:
+                if self.is_cancelled():
+                    break
+                    
+                rds_instances.append({
+                    'Region': region,
+                    'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
+                    'DBInstanceClass': instance['DBInstanceClass'],
+                    'Engine': instance['Engine'],
+                    'EngineVersion': instance['EngineVersion'],
+                    'DBInstanceStatus': instance['DBInstanceStatus'],
+                    'AllocatedStorage': instance['AllocatedStorage'],
+                    'StorageType': instance.get('StorageType', 'N/A'),
+                    'MultiAZ': instance['MultiAZ'],
+                    'PubliclyAccessible': instance['PubliclyAccessible'],
+                    'AvailabilityZone': instance.get('AvailabilityZone', 'N/A'),
+                    'VpcId': instance.get('DbSubnetGroup', {}).get('VpcId', 'N/A')
+                })
+                
+            # RDS Clusters (Aurora)
             try:
-                print(f"   🌍 Processando RDS em {region}...")
-                rds = self.get_boto3_client('rds', region)
+                clusters = rds.describe_db_clusters()
+                for cluster in clusters['DBClusters']:
+                    if self.is_cancelled():
+                        break
+                        
+                    rds_instances.append({
+                        'Region': region,
+                        'DBClusterIdentifier': cluster['DBClusterIdentifier'],
+                        'Engine': cluster['Engine'],
+                        'EngineVersion': cluster['EngineVersion'],
+                        'Status': cluster['Status'],
+                        'DatabaseName': cluster.get('DatabaseName', 'N/A'),
+                        'MasterUsername': cluster['MasterUsername'],
+                        'ClusterMembers': len(cluster.get('DBClusterMembers', [])),
+                        'Type': 'Aurora Cluster'
+                    })
+            except:
+                pass  # Região pode não suportar Aurora
                 
-                # RDS Instances com timeout
-                try:
-                    start_time = time.time()
-                    instances = rds.describe_db_instances()
-                    
-                    if time.time() - start_time > 45:
-                        print(f"   ⚠️ Timeout RDS instances em {region}")
-                        return region_instances
-                    
-                    for instance in instances['DBInstances']:
-                        region_instances.append({
-                            'Region': region,
-                            'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
-                            'DBInstanceClass': instance['DBInstanceClass'],
-                            'Engine': instance['Engine'],
-                            'EngineVersion': instance['EngineVersion'],
-                            'DBInstanceStatus': instance['DBInstanceStatus'],
-                            'AllocatedStorage': instance['AllocatedStorage'],
-                            'StorageType': instance.get('StorageType', 'N/A'),
-                            'MultiAZ': instance['MultiAZ'],
-                            'PubliclyAccessible': instance['PubliclyAccessible'],
-                            'AvailabilityZone': instance.get('AvailabilityZone', 'N/A'),
-                            'VpcId': instance.get('DbSubnetGroup', {}).get('VpcId', 'N/A'),
-                            'Type': 'RDS Instance'
-                        })
-                except Exception as rds_error:
-                    print(f"   ⚠️ Erro RDS instances {region}: {str(rds_error)[:50]}...")
-                    self.log_error('rds-instances', region, rds_error)
-                
-                # RDS Clusters (Aurora) com tratamento separado
-                try:
-                    start_time = time.time()
-                    clusters = rds.describe_db_clusters()
-                    
-                    if time.time() - start_time > 45:
-                        print(f"   ⚠️ Timeout RDS clusters em {region}")
-                        return region_instances
-                    
-                    for cluster in clusters['DBClusters']:
-                        region_instances.append({
-                            'Region': region,
-                            'DBClusterIdentifier': cluster['DBClusterIdentifier'],
-                            'Engine': cluster['Engine'],
-                            'EngineVersion': cluster['EngineVersion'],
-                            'Status': cluster['Status'],
-                            'DatabaseName': cluster.get('DatabaseName', 'N/A'),
-                            'MasterUsername': cluster.get('MasterUsername', 'N/A'),
-                            'ClusterMembers': len(cluster.get('DBClusterMembers', [])),
-                            'Type': 'Aurora Cluster'
-                        })
-                except Exception as cluster_error:
-                    # Aurora pode não estar disponível em todas as regiões
-                    if "InvalidParameterValue" not in str(cluster_error):
-                        print(f"   ⚠️ Erro RDS clusters {region}: {str(cluster_error)[:50]}...")
-                        self.log_error('rds-clusters', region, cluster_error)
-                
-                print(f"   ✅ RDS {region}: {len(region_instances)} instâncias")
-                    
-            except Exception as e:
-                print(f"   ❌ Erro RDS geral {region}: {str(e)[:50]}...")
-                self.log_error('rds', region, e)
-            
-            return region_instances
+        except Exception as e:
+            pass  # Erro será logado pelo método pai
         
-        # Processamento paralelo
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_region = {executor.submit(process_region_rds, region): region for region in regions}
-            
-            for future in as_completed(future_to_region, timeout=250):
-                try:
-                    region_instances = future.result()
-                    rds_instances.extend(region_instances)
-                except Exception as e:
-                    region = future_to_region[future]
-                    print(f"   ❌ Falha na thread RDS {region}: {str(e)}")
-        
-        print(f"✅ RDS concluído: {len(rds_instances)} instâncias encontradas")
         return rds_instances
     
     def list_load_balancers(self):
@@ -693,14 +641,17 @@ class AWSCostInventory:
         return eips
     
     def list_cloudfront_distributions(self):
-        """Listar distribuições CloudFront"""
+        """Listar distribuições CloudFront - versão otimizada"""
         distributions = []
         try:
-            cf = boto3.client('cloudfront')
+            cf = boto3.client('cloudfront', config=self.config)
             response = cf.list_distributions()
             
             if 'DistributionList' in response and response['DistributionList']['Quantity'] > 0:
                 for dist in response['DistributionList']['Items']:
+                    if self.is_cancelled():
+                        break
+                        
                     distributions.append({
                         'Id': dist['Id'],
                         'DomainName': dist['DomainName'],
@@ -953,249 +904,399 @@ class AWSCostInventory:
         return clusters
 
     def run_inventory(self):
-        """Executar inventário completo com indicadores de progresso"""
-        total_start = time.time()
-        print("🚀 Iniciando inventário COMPLETO e OTIMIZADO de recursos AWS...")
-        print("=" * 60)
+        """Executar inventário completo com timeouts e progresso"""
+        print("🚀 Iniciando inventário OTIMIZADO de recursos AWS...")
+        print(f"⏱️ Timeout configurado: 30 minutos máximo")
+        print(f"🌍 Processando até {len(self.get_all_regions())} regiões em paralelo")
+        print("💡 Use Ctrl+C para cancelar a qualquer momento\n")
         
-        services = [
-            ('EC2 Instances', 'list_ec2_instances'),
-            ('EBS Volumes', 'list_ebs_volumes'), 
-            ('S3 Buckets', 'list_s3_buckets'),
-            ('RDS Instances', 'list_rds_instances'),
-            ('Load Balancers', 'list_load_balancers'),
-            ('Lambda Functions', 'list_lambda_functions'),
-            ('NAT Gateways', 'list_nat_gateways'),
-            ('Elastic IPs', 'list_elastic_ips'),
-            ('CloudFront Distributions', 'list_cloudfront_distributions')
+        max_runtime = 30 * 60  # 30 minutos máximo
+        
+        tasks = [
+            ("EC2", self.list_ec2_instances),
+            ("EBS", self.list_ebs_volumes), 
+            ("S3", self.list_s3_buckets),
+            ("RDS", self.list_rds_instances),
+            ("Load Balancers", self.list_load_balancers_optimized),
+            ("Lambda", self.list_lambda_functions_optimized),
+            ("NAT Gateways", self.list_nat_gateways_optimized),
+            ("Elastic IPs", self.list_elastic_ips_optimized),
+            ("CloudFront", self.list_cloudfront_distributions)
         ]
         
-        completed_services = 0
-        total_services = len(services)
+        total_tasks = len(tasks)
         
-        for service_name, method_name in services:
-            completed_services += 1
-            progress = (completed_services / total_services) * 100
+        for i, (service_name, task_func) in enumerate(tasks, 1):
+            if self.is_cancelled():
+                print("⚠️ Inventário cancelado pelo usuário")
+                break
+                
+            elapsed = self.get_elapsed_time()
+            if elapsed > max_runtime:
+                print(f"⏰ Timeout global atingido ({max_runtime//60} min). Finalizando...")
+                break
             
-            print(f"\n📊 [{completed_services}/{total_services}] ({progress:.1f}%) - Coletando {service_name}...")
-            service_start = time.time()
+            progress = f"[{i}/{total_tasks}]"
+            print(f"\n{progress} Coletando {service_name}...")
             
             try:
-                method = getattr(self, method_name)
-                results = method()
+                start_time = time.time()
                 
-                # Mapear nomes para chaves do inventário
-                key_mapping = {
-                    'EC2 Instances': 'EC2_Instances',
-                    'EBS Volumes': 'EBS_Volumes',
-                    'S3 Buckets': 'S3_Buckets',
-                    'RDS Instances': 'RDS_Instances',
-                    'Load Balancers': 'Load_Balancers',
-                    'Lambda Functions': 'Lambda_Functions',
-                    'NAT Gateways': 'NAT_Gateways',
-                    'Elastic IPs': 'Elastic_IPs',
-                    'CloudFront Distributions': 'CloudFront_Distributions'
-                }
+                if service_name == "EC2":
+                    self.inventory['EC2_Instances'] = task_func()
+                elif service_name == "EBS":
+                    self.inventory['EBS_Volumes'] = task_func()
+                elif service_name == "S3":
+                    self.inventory['S3_Buckets'] = task_func()
+                elif service_name == "RDS":
+                    self.inventory['RDS_Instances'] = task_func()
+                elif service_name == "Load Balancers":
+                    self.inventory['Load_Balancers'] = task_func()
+                elif service_name == "Lambda":
+                    self.inventory['Lambda_Functions'] = task_func()
+                elif service_name == "NAT Gateways":
+                    self.inventory['NAT_Gateways'] = task_func()
+                elif service_name == "Elastic IPs":
+                    self.inventory['Elastic_IPs'] = task_func()
+                elif service_name == "CloudFront":
+                    self.inventory['CloudFront_Distributions'] = task_func()
                 
-                key = key_mapping[service_name]
-                self.inventory[key] = results
-                
-                service_time = time.time() - service_start
-                print(f"   ✅ {service_name}: {len(results)} recursos em {service_time:.1f}s")
+                duration = time.time() - start_time
+                count = len(self.inventory.get(service_name.replace(' ', '_').replace(' ', ''), []))
+                print(f"✅ {service_name}: {count} recursos em {duration:.1f}s")
                 
             except Exception as e:
-                print(f"   ❌ Erro em {service_name}: {str(e)}")
-                self.log_error(service_name.lower().replace(' ', '-'), 'global', e)
+                print(f"❌ Erro ao coletar {service_name}: {str(e)[:100]}")
+                self.log_error(service_name.lower(), 'global', e)
         
-        # Recursos adicionais com indicador de progresso
-        print(f"\n📊 Coletando recursos adicionais...")
-        additional_start = time.time()
+        # Recursos adicionais (se tempo permitir)
+        elapsed = self.get_elapsed_time()
+        if elapsed < max_runtime * 0.8 and not self.is_cancelled():  # Se usado menos de 80% do tempo
+            print(f"\n[Extra] Coletando recursos adicionais...")
+            try:
+                additional = self.list_additional_cost_resources_optimized()
+                self.inventory.update(additional)
+            except Exception as e:
+                print(f"⚠️ Erro nos recursos adicionais: {str(e)[:100]}")
         
-        try:
-            additional = self.list_additional_cost_resources()
-            self.inventory.update(additional)
-            
-            additional_time = time.time() - additional_start
-            print(f"   ✅ Recursos adicionais coletados em {additional_time:.1f}s")
-            
-        except Exception as e:
-            print(f"   ❌ Erro em recursos adicionais: {str(e)}")
-            self.log_error('additional-resources', 'global', e)
-        
-        # Finalizar com resumo
-        total_time = time.time() - total_start
-        
-        # Adicionar timestamp e resumo
+        # Adicionar metadata final
         self.inventory['_metadata'] = {
             'generated_at': datetime.utcnow().isoformat(),
-            'total_time': f"{total_time:.1f}s",
+            'execution_time_seconds': round(self.get_elapsed_time(), 2),
             'total_errors': len(self.errors),
-            'summary': {
-                'ec2_instances': len(self.inventory.get('EC2_Instances', [])),
-                'ebs_volumes': len(self.inventory.get('EBS_Volumes', [])),
-                's3_buckets': len(self.inventory.get('S3_Buckets', [])),
-                'rds_instances': len(self.inventory.get('RDS_Instances', [])),
-                'load_balancers': len(self.inventory.get('Load_Balancers', [])),
-                'lambda_functions': len(self.inventory.get('Lambda_Functions', [])),
-                'nat_gateways': len(self.inventory.get('NAT_Gateways', [])),
-                'elastic_ips': len(self.inventory.get('Elastic_IPs', [])),
-                'cloudfront_distributions': len(self.inventory.get('CloudFront_Distributions', [])),
-                'efs_filesystems': len(self.inventory.get('EFS_FileSystems', [])),
-                'elasticache_clusters': len(self.inventory.get('ElastiCache_Clusters', [])),
-                'redshift_clusters': len(self.inventory.get('Redshift_Clusters', [])),
-                'opensearch_domains': len(self.inventory.get('OpenSearch_Domains', [])),
-                'api_gateways': len(self.inventory.get('API_Gateways', [])),
-                'ecs_clusters': len(self.inventory.get('ECS_Clusters', [])),
-                'eks_clusters': len(self.inventory.get('EKS_Clusters', []))
-            },
-            'optimizations_applied': [
-                'Timeouts em todas as consultas',
-                'Processamento paralelo por região',
-                'Limite de objetos S3',
-                'Fallbacks para CloudWatch',
-                'Tratamento robusto de erros'
-            ]
+            'cancelled': self.cancelled,
+            'summary': self._generate_summary()
         }
         
         if self.errors:
             self.inventory['_errors'] = self.errors
         
-        print("\n" + "=" * 60)
-        print(f"🎉 Inventário concluído em {total_time:.1f} segundos!")
-        print(f"⚡ Otimizações aplicadas preveniram travamentos")
-        
         return self.inventory
 
+    def _generate_summary(self):
+        """Gerar resumo dos recursos coletados"""
+        summary = {}
+        service_mapping = {
+            'EC2_Instances': 'ec2_instances',
+            'EBS_Volumes': 'ebs_volumes',
+            'S3_Buckets': 's3_buckets',
+            'RDS_Instances': 'rds_instances',
+            'Load_Balancers': 'load_balancers',
+            'Lambda_Functions': 'lambda_functions',
+            'NAT_Gateways': 'nat_gateways',
+            'Elastic_IPs': 'elastic_ips',
+            'CloudFront_Distributions': 'cloudfront_distributions'
+        }
+        
+        for key, summary_key in service_mapping.items():
+            summary[summary_key] = len(self.inventory.get(key, []))
+            
+        # Adicionar recursos extras se existirem
+        extra_services = [
+            'EFS_FileSystems', 'ElastiCache_Clusters', 'Redshift_Clusters',
+            'OpenSearch_Domains', 'API_Gateways', 'ECS_Clusters', 'EKS_Clusters'
+        ]
+        
+        for service in extra_services:
+            if service in self.inventory:
+                summary[service.lower()] = len(self.inventory[service])
+        
+        return summary
+
+    # Métodos otimizados para outros recursos
+    def list_load_balancers_optimized(self):
+        return self.parallel_region_query('Load Balancers', self.get_load_balancers_by_region, max_workers=2)
+
+    def list_lambda_functions_optimized(self):
+        return self.parallel_region_query('Lambda', self.get_lambda_functions_by_region, max_workers=2)
+
+    def list_nat_gateways_optimized(self):
+        return self.parallel_region_query('NAT Gateway', self.get_nat_gateways_by_region, max_workers=2)
+
+    def get_load_balancers_by_region(self, region):
+        """Obter Load Balancers de uma região específica"""
+        load_balancers = []
+        try:
+            # ELBv2 (ALB/NLB)
+            elbv2 = boto3.client('elbv2', region_name=region, config=self.config)
+            lbs = elbv2.describe_load_balancers()
+            
+            for lb in lbs['LoadBalancers']:
+                if self.is_cancelled():
+                    break
+                    
+                load_balancers.append({
+                    'Region': region,
+                    'LoadBalancerName': lb['LoadBalancerName'],
+                    'LoadBalancerArn': lb['LoadBalancerArn'],
+                    'Type': lb['Type'],
+                    'Scheme': lb['Scheme'],
+                    'State': lb['State']['Code'],
+                    'VpcId': lb.get('VpcId', 'N/A'),
+                    'AvailabilityZones': [az['ZoneName'] for az in lb.get('AvailabilityZones', [])],
+                    'CreatedTime': lb['CreatedTime'].isoformat()
+                })
+            
+            # Classic Load Balancers
+            elb = boto3.client('elb', region_name=region, config=self.config)
+            classic_lbs = elb.describe_load_balancers()
+            
+            for clb in classic_lbs['LoadBalancerDescriptions']:
+                if self.is_cancelled():
+                    break
+                    
+                load_balancers.append({
+                    'Region': region,
+                    'LoadBalancerName': clb['LoadBalancerName'],
+                    'Type': 'classic',
+                    'Scheme': clb['Scheme'],
+                    'VpcId': clb.get('VPCId', 'Classic'),
+                    'AvailabilityZones': clb['AvailabilityZones'],
+                    'CreatedTime': clb['CreatedTime'].isoformat()
+                })
+                
+        except Exception as e:
+            pass  # Erro será logado pelo método pai
+        
+        return load_balancers
+
+    def get_lambda_functions_by_region(self, region):
+        """Obter funções Lambda de uma região específica"""
+        functions = []
+        try:
+            lambda_client = boto3.client('lambda', region_name=region, config=self.config)
+            response = lambda_client.list_functions()
+            
+            for func in response['Functions']:
+                if self.is_cancelled():
+                    break
+                    
+                functions.append({
+                    'Region': region,
+                    'FunctionName': func['FunctionName'],
+                    'Runtime': func.get('Runtime', 'N/A'),
+                    'CodeSize': func['CodeSize'],
+                    'MemorySize': func['MemorySize'],
+                    'Timeout': func['Timeout'],
+                    'LastModified': func['LastModified'],
+                    'State': func.get('State', 'N/A'),
+                    'FunctionArn': func['FunctionArn']
+                })
+                
+        except Exception as e:
+            pass  # Erro será logado pelo método pai
+        
+        return functions
+
+    def get_nat_gateways_by_region(self, region):
+        """Obter NAT Gateways de uma região específica"""
+        nat_gateways = []
+        try:
+            ec2 = boto3.client('ec2', region_name=region, config=self.config)
+            response = ec2.describe_nat_gateways()
+            
+            for nat in response['NatGateways']:
+                if self.is_cancelled():
+                    break
+                    
+                tags = {tag['Key']: tag['Value'] for tag in nat.get('Tags', [])}
+                
+                nat_gateways.append({
+                    'Region': region,
+                    'NatGatewayId': nat['NatGatewayId'],
+                    'State': nat['State'],
+                    'VpcId': nat['VpcId'],
+                    'SubnetId': nat['SubnetId'],
+                    'PublicIp': nat['NatGatewayAddresses'][0]['PublicIp'] if nat.get('NatGatewayAddresses') else 'N/A',
+                    'CreatedTime': nat['CreateTime'].isoformat(),
+                    'Name': tags.get('Name', 'N/A')
+                })
+                
+        except Exception as e:
+            pass  # Erro será logado pelo método pai
+        
+        return nat_gateways
+
+    def get_elastic_ips_by_region(self, region):
+        """Obter Elastic IPs de uma região específica"""
+        eips = []
+        try:
+            ec2 = boto3.client('ec2', region_name=region, config=self.config)
+            response = ec2.describe_addresses()
+            
+            for eip in response['Addresses']:
+                if self.is_cancelled():
+                    break
+                    
+                tags = {tag['Key']: tag['Value'] for tag in eip.get('Tags', [])}
+                
+                eips.append({
+                    'Region': region,
+                    'PublicIp': eip['PublicIp'],
+                    'AllocationId': eip.get('AllocationId', 'N/A'),
+                    'AssociationId': eip.get('AssociationId', 'N/A'),
+                    'InstanceId': eip.get('InstanceId', 'N/A'),
+                    'Domain': eip['Domain'],
+                    'Name': tags.get('Name', 'N/A')
+                })
+                
+        except Exception as e:
+            pass  # Erro será logado pelo método pai
+        
+        return eips
+
+    def list_additional_cost_resources_optimized(self):
+        """Listar recursos adicionais com timeout reduzido"""
+        additional_resources = {}
+        
+        # Só coletar recursos extras se ainda temos tempo
+        if self.get_elapsed_time() < 20 * 60:  # Menos de 20 minutos
+            extra_tasks = [
+                ("EFS", self.list_efs_filesystems_optimized, "EFS_FileSystems"),
+                ("ElastiCache", self.list_elasticache_clusters_optimized, "ElastiCache_Clusters"),
+            ]
+            
+            for service_name, task_func, key in extra_tasks:
+                if self.is_cancelled() or self.get_elapsed_time() > 25 * 60:
+                    break
+                    
+                try:
+                    print(f"   Coletando {service_name}...")
+                    additional_resources[key] = task_func()
+                except Exception as e:
+                    print(f"   ⚠️ {service_name}: {str(e)[:50]}")
+        
+        return additional_resources
+
+    def list_efs_filesystems_optimized(self):
+        return self.parallel_region_query('EFS', self.get_efs_by_region, max_workers=2, timeout=60)
+
+    def list_elasticache_clusters_optimized(self):
+        return self.parallel_region_query('ElastiCache', self.get_elasticache_by_region, max_workers=2, timeout=60)
+
+    def get_efs_by_region(self, region):
+        """Obter sistemas EFS de uma região específica"""
+        filesystems = []
+        try:
+            efs = boto3.client('efs', region_name=region, config=self.config)
+            response = efs.describe_file_systems()
+            
+            for fs in response['FileSystems']:
+                if self.is_cancelled():
+                    break
+                    
+                filesystems.append({
+                    'Region': region,
+                    'FileSystemId': fs['FileSystemId'],
+                    'State': fs['LifeCycleState'],
+                    'SizeBytes': fs.get('SizeInBytes', {}).get('Value', 0),
+                    'ThroughputMode': fs.get('ThroughputMode', 'N/A'),
+                    'PerformanceMode': fs.get('PerformanceMode', 'N/A'),
+                    'CreationTime': fs['CreationTime'].isoformat(),
+                    'NumberOfMountTargets': fs.get('NumberOfMountTargets', 0)
+                })
+        except Exception as e:
+            pass
+        
+        return filesystems
+
+    def get_elasticache_by_region(self, region):
+        """Obter clusters ElastiCache de uma região específica"""
+        clusters = []
+        try:
+            ec = boto3.client('elasticache', region_name=region, config=self.config)
+            
+            # Redis clusters
+            redis_clusters = ec.describe_cache_clusters()
+            for cluster in redis_clusters['CacheClusters']:
+                if self.is_cancelled():
+                    break
+                    
+                clusters.append({
+                    'Region': region,
+                    'ClusterId': cluster['CacheClusterId'],
+                    'Engine': cluster['Engine'],
+                    'EngineVersion': cluster['EngineVersion'],
+                    'NodeType': cluster['CacheNodeType'],
+                    'Status': cluster['CacheClusterStatus'],
+                    'NumNodes': cluster['NumCacheNodes'],
+                    'Type': 'Cache Cluster'
+                })
+            
+            # Replication groups
+            try:
+                repl_groups = ec.describe_replication_groups()
+                for group in repl_groups['ReplicationGroups']:
+                    if self.is_cancelled():
+                        break
+                        
+                    clusters.append({
+                        'Region': region,
+                        'ReplicationGroupId': group['ReplicationGroupId'],
+                        'Status': group['Status'],
+                        'NodeType': group.get('CacheNodeType', 'N/A'),
+                        'NumNodeGroups': len(group.get('NodeGroups', [])),
+                        'Type': 'Replication Group'
+                    })
+            except:
+                pass
+                
+        except Exception as e:
+            pass
+        
+        return clusters
+
 def main():
-    print("🔧 AWS Cost Inventory - Versão Otimizada")
-    print("=" * 50)
-    
     try:
-        # Verificar credenciais AWS com timeout
-        print("🔐 Verificando credenciais AWS...")
-        start_time = time.time()
-        
-        sts = boto3.client('sts', 
-                          config=boto3.session.Config(
-                              read_timeout=10,
-                              connect_timeout=5,
-                              retries={'max_attempts': 2}
-                          ))
+        # Verificar credenciais AWS
+        sts = boto3.client('sts')
         identity = sts.get_caller_identity()
-        
-        check_time = time.time() - start_time
-        print(f"✅ Credenciais válidas ({check_time:.1f}s)")
-        print(f"   📋 Account: {identity['Account']}")
-        print(f"   👤 User: {identity.get('Arn', 'N/A')}")
+        print(f"✅ Credenciais AWS válidas - Account: {identity['Account']}, User: {identity.get('Arn', 'N/A')}")
         
     except (NoCredentialsError, ClientError) as e:
         print(f"❌ Erro nas credenciais AWS: {e}")
         print("💡 Certifique-se de estar executando no CloudShell ou com credenciais configuradas")
-        print("💡 Ou configure: aws configure")
         sys.exit(1)
-    except Exception as e:
-        print(f"⚠️ Erro na verificação: {e}")
-        print("🔄 Continuando mesmo assim...")
-    
-    print("\n" + "=" * 50)
     
     # Executar inventário
     inventory = AWSCostInventory()
+    results = inventory.run_inventory()
     
-    try:
-        results = inventory.run_inventory()
-        
-        # Salvar resultado
-        output_file = f'aws_cost_inventory_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False, default=str)
-        
-        print(f"\n✅ Inventário salvo em '{output_file}'")
-        
-        # Resumo detalhado
-        print(f"\n📊 Resumo Final:")
-        metadata = results.get('_metadata', {})
-        summary = metadata.get('summary', {})
-        
-        for service, count in summary.items():
-            service_display = service.replace('_', ' ').title()
-            if count > 0:
-                print(f"   ✅ {service_display}: {count}")
-            else:
-                print(f"   ➖ {service_display}: {count}")
-        
-        # Informações adicionais
-        print(f"\n⏱️ Tempo total: {metadata.get('total_time', 'N/A')}")
-        
-        if results.get('_errors'):
-            error_count = len(results['_errors'])
-            print(f"⚠️ Erros encontrados: {error_count}")
-            print("   💡 Verifique o arquivo JSON para detalhes dos erros")
-        else:
-            print("✅ Nenhum erro encontrado!")
-        
-        # Otimizações aplicadas
-        optimizations = metadata.get('optimizations_applied', [])
-        if optimizations:
-            print(f"\n⚡ Otimizações aplicadas:")
-            for opt in optimizations:
-                print(f"   • {opt}")
-        
-        print(f"\n📄 Para visualizar o resultado:")
-        print(f"   Notepad {output_file}")
-        print(f"   ou: type {output_file} | more")
-        
-        # Criar arquivo de resumo rápido
-        summary_file = f'aws_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            f.write("AWS Cost Inventory - Resumo Executivo\n")
-            f.write("=" * 40 + "\n\n")
-            f.write(f"Data: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-            f.write(f"Account: {identity['Account']}\n")
-            f.write(f"Tempo total: {metadata.get('total_time', 'N/A')}\n\n")
-            
-            f.write("Recursos Encontrados:\n")
-            f.write("-" * 20 + "\n")
-            for service, count in summary.items():
-                service_display = service.replace('_', ' ').title()
-                f.write(f"{service_display}: {count}\n")
-            
-            if results.get('_errors'):
-                f.write(f"\nErros: {len(results['_errors'])}\n")
-            
-            f.write(f"\nArquivo detalhado: {output_file}\n")
-        
-        print(f"📋 Resumo executivo salvo em '{summary_file}'")
-        
-    except KeyboardInterrupt:
-        print(f"\n🛑 Inventário interrompido pelo usuário")
-        print(f"💾 Salvando dados coletados até agora...")
-        
-        # Salvar dados parciais
-        if inventory.inventory:
-            partial_file = f'aws_inventory_partial_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-            with open(partial_file, 'w', encoding='utf-8') as f:
-                json.dump(inventory.inventory, f, indent=2, ensure_ascii=False, default=str)
-            print(f"💾 Dados parciais salvos em '{partial_file}'")
-        
-        sys.exit(1)
-        
-    except Exception as e:
-        print(f"\n❌ Erro durante o inventário: {e}")
-        print(f"🐛 Detalhes técnicos: {type(e).__name__}")
-        
-        # Tentar salvar dados parciais
-        if hasattr(inventory, 'inventory') and inventory.inventory:
-            error_file = f'aws_inventory_error_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-            try:
-                with open(error_file, 'w', encoding='utf-8') as f:
-                    json.dump(inventory.inventory, f, indent=2, ensure_ascii=False, default=str)
-                print(f"💾 Dados parciais salvos em '{error_file}'")
-            except:
-                print("❌ Não foi possível salvar dados parciais")
-        
-        sys.exit(1)
+    # Salvar resultado
+    output_file = 'aws_cost_inventory.json'
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False, default=str)
+    
+    print(f"\n✅ Inventário completo salvo em '{output_file}'")
+    print(f"📊 Resumo:")
+    for service, count in results['_metadata']['summary'].items():
+        print(f"   • {service.replace('_', ' ').title()}: {count}")
+    
+    if results.get('_errors'):
+        print(f"⚠️ Total de erros encontrados: {len(results['_errors'])}")
+    
+    print(f"\n📄 Para visualizar o resultado completo:")
+    print(f"   cat {output_file} | jq .")
 
 if __name__ == "__main__":
     main()
