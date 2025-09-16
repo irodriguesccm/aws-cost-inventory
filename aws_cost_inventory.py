@@ -1,14 +1,75 @@
 import boto3
 import json
+import os
 from datetime import datetime, timedelta
 from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.config import Config
 import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import signal
 
 class AWSCostInventory:
     def __init__(self):
         self.inventory = {}
         self.errors = []
+        self.failed_regions = set()
+        self.max_s3_objects = 10000  # Limite para evitar travamentos
+        self.timeout_seconds = 30
         
+        # Configuração de timeout para clientes boto3
+        self.boto_config = Config(
+            region_name='us-east-1',
+            retries={
+                'max_attempts': 3,
+                'mode': 'adaptive'
+            },
+            read_timeout=self.timeout_seconds,
+            connect_timeout=self.timeout_seconds
+        )
+        
+    def create_client(self, service_name, region_name=None):
+        """Criar cliente AWS com configuração de timeout"""
+        config = Config(
+            region_name=region_name or 'us-east-1',
+            retries={
+                'max_attempts': 3,
+                'mode': 'adaptive'
+            },
+            read_timeout=self.timeout_seconds,
+            connect_timeout=self.timeout_seconds
+        )
+        return boto3.client(service_name, region_name=region_name, config=config)
+    
+    def with_timeout(self, func, timeout=None, *args, **kwargs):
+        """Executar função com timeout usando threading"""
+        if timeout is None:
+            timeout = self.timeout_seconds
+            
+        result = [None]
+        exception = [None]
+        
+        def target():
+            try:
+                result[0] = func(*args, **kwargs)
+            except Exception as e:
+                exception[0] = e
+        
+        thread = threading.Thread(target=target)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            # Thread ainda rodando - timeout
+            raise TimeoutError(f"Operação expirou após {timeout} segundos")
+        
+        if exception[0]:
+            raise exception[0]
+        
+        return result[0]
+    
     def log_error(self, service, region, error):
         """Log de erros para análise posterior"""
         self.errors.append({
@@ -17,16 +78,24 @@ class AWSCostInventory:
             "error": str(error),
             "timestamp": datetime.utcnow().isoformat()
         })
+        print(f"⚠️ Erro {service} ({region}): {str(error)[:100]}...")
     
     def get_all_regions(self):
-        """Obter todas as regiões AWS disponíveis"""
+        """Obter todas as regiões AWS disponíveis com fallback"""
         try:
-            ec2 = boto3.client('ec2', region_name='us-east-1')
+            ec2 = self.create_client('ec2', 'us-east-1')
             regions = [r['RegionName'] for r in ec2.describe_regions()['Regions']]
+            print(f"✅ Encontradas {len(regions)} regiões AWS")
             return regions
         except Exception as e:
             self.log_error('ec2', 'global', e)
-            return ['us-east-1', 'us-west-2', 'eu-west-1']  # fallback básico
+            # Fallback com principais regiões
+            fallback_regions = [
+                'us-east-1', 'us-west-2', 'eu-west-1', 'ap-northeast-1',
+                'us-west-1', 'eu-central-1', 'ap-southeast-1', 'sa-east-1'
+            ]
+            print(f"⚠️ Usando regiões fallback: {len(fallback_regions)}")
+            return fallback_regions
     
     def list_ec2_instances(self):
         """Listar instâncias EC2 com informações de storage"""
@@ -112,25 +181,29 @@ class AWSCostInventory:
         return volumes
     
     def list_s3_buckets(self):
-        """Listar buckets S3 com tamanhos usando múltiplas estratégias"""
+        """Listar buckets S3 com timeouts e otimizações"""
         buckets = []
         try:
-            s3 = boto3.client('s3')
+            s3 = self.create_client('s3')
             response = s3.list_buckets()
             
-            for bucket in response['Buckets']:
+            total_buckets = len(response['Buckets'])
+            print(f"🪣 Encontrados {total_buckets} buckets S3")
+            
+            for i, bucket in enumerate(response['Buckets'], 1):
                 bucket_name = bucket['Name']
-                print(f"🔍 Analisando bucket: {bucket_name}")
+                print(f"🔍 [{i}/{total_buckets}] Analisando bucket: {bucket_name}")
                 
-                # Obter região do bucket
+                # Obter região do bucket com timeout
                 try:
                     bucket_region = s3.get_bucket_location(Bucket=bucket_name)['LocationConstraint']
                     if bucket_region is None:
                         bucket_region = 'us-east-1'
-                except:
+                except Exception as e:
+                    print(f"   ⚠️ Erro ao obter região: {str(e)[:50]}...")
                     bucket_region = 'unknown'
                 
-                # Múltiplas estratégias para obter o tamanho
+                # Obter tamanho com timeout e limitações
                 size_info = self.get_bucket_size(bucket_name, bucket_region)
                 
                 buckets.append({
@@ -139,7 +212,8 @@ class AWSCostInventory:
                     'CreationDate': bucket['CreationDate'].isoformat(),
                     'Size': size_info['formatted_size'],
                     'ObjectCount': size_info['object_count'],
-                    'SizeBytes': size_info['size_bytes']
+                    'SizeBytes': size_info['size_bytes'],
+                    'AnalysisMethod': size_info['method_used']
                 })
                 
         except Exception as e:
@@ -148,59 +222,23 @@ class AWSCostInventory:
         return buckets
 
     def get_bucket_size(self, bucket_name, bucket_region):
-        """Obter tamanho do bucket usando várias estratégias"""
+        """Obter tamanho do bucket com timeout e limite de objetos"""
         size_info = {
             'size_bytes': 0,
             'object_count': 0,
-            'formatted_size': 'N/A'
+            'formatted_size': 'N/A',
+            'method_used': 'none'
         }
         
         try:
-            s3 = boto3.client('s3')
+            print(f"   📋 Analisando bucket {bucket_name} (timeout: {self.timeout_seconds}s)...")
             
-            # Estratégia 1: Listar objetos diretamente (mais preciso mas pode ser lento)
-            print(f"   📋 Listando objetos do bucket {bucket_name}...")
-            paginator = s3.get_paginator('list_objects_v2')
-            page_iterator = paginator.paginate(Bucket=bucket_name)
-            
-            total_size = 0
-            total_count = 0
-            
-            for page in page_iterator:
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        total_size += obj['Size']
-                        total_count += 1
-            
-            size_info['size_bytes'] = total_size
-            size_info['object_count'] = total_count
-            
-            # Formatar tamanho
-            if total_size == 0:
-                size_info['formatted_size'] = "0 B (Bucket vazio)"
-            elif total_size < 1024:
-                size_info['formatted_size'] = f"{total_size} B"
-            elif total_size < 1024**2:
-                size_info['formatted_size'] = f"{total_size/1024:.2f} KB"
-            elif total_size < 1024**3:
-                size_info['formatted_size'] = f"{total_size/(1024**2):.2f} MB"
-            elif total_size < 1024**4:
-                size_info['formatted_size'] = f"{total_size/(1024**3):.2f} GB"
-            else:
-                size_info['formatted_size'] = f"{total_size/(1024**4):.2f} TB"
-            
-            print(f"   ✅ Bucket {bucket_name}: {size_info['formatted_size']} ({total_count} objetos)")
-            return size_info
-            
-        except Exception as e:
-            print(f"   ⚠️ Erro ao listar objetos diretamente: {str(e)}")
-            # Fallback: Tentar CloudWatch se a listagem direta falhar
+            # Estratégia 1: Tentar CloudWatch primeiro (mais rápido)
             try:
-                print(f"   🔄 Tentando CloudWatch para {bucket_name}...")
-                cw_region = 'us-east-1' if bucket_region == 'us-east-1' else bucket_region
-                cw = boto3.client('cloudwatch', region_name=cw_region)
+                cw_region = 'us-east-1' if bucket_region in [None, 'us-east-1'] else bucket_region
+                cw = self.create_client('cloudwatch', cw_region)
                 
-                # Tentar obter métricas dos últimos 7 dias
+                # Tentar obter métricas dos últimos 2 dias
                 metric = cw.get_metric_statistics(
                     Namespace='AWS/S3',
                     MetricName='BucketSizeBytes',
@@ -208,7 +246,7 @@ class AWSCostInventory:
                         {'Name': 'BucketName', 'Value': bucket_name},
                         {'Name': 'StorageType', 'Value': 'StandardStorage'}
                     ],
-                    StartTime=datetime.utcnow() - timedelta(days=7),
+                    StartTime=datetime.utcnow() - timedelta(days=2),
                     EndTime=datetime.utcnow(),
                     Period=86400,
                     Statistics=['Average']
@@ -217,43 +255,99 @@ class AWSCostInventory:
                 if metric['Datapoints']:
                     size_bytes = metric['Datapoints'][-1]['Average']
                     size_info['size_bytes'] = size_bytes
+                    size_info['method_used'] = 'cloudwatch'
                     
-                    if size_bytes < 1024:
-                        size_info['formatted_size'] = f"{size_bytes:.0f} B"
-                    elif size_bytes < 1024**2:
-                        size_info['formatted_size'] = f"{size_bytes/1024:.2f} KB"
-                    elif size_bytes < 1024**3:
-                        size_info['formatted_size'] = f"{size_bytes/(1024**2):.2f} MB"
-                    else:
-                        size_info['formatted_size'] = f"{size_bytes/(1024**3):.2f} GB"
-                
-                # Tentar obter contagem de objetos
-                count_metric = cw.get_metric_statistics(
-                    Namespace='AWS/S3',
-                    MetricName='NumberOfObjects',
-                    Dimensions=[
-                        {'Name': 'BucketName', 'Value': bucket_name},
-                        {'Name': 'StorageType', 'Value': 'AllStorageTypes'}
-                    ],
-                    StartTime=datetime.utcnow() - timedelta(days=7),
-                    EndTime=datetime.utcnow(),
-                    Period=86400,
-                    Statistics=['Average']
-                )
-                
-                if count_metric['Datapoints']:
-                    size_info['object_count'] = int(count_metric['Datapoints'][-1]['Average'])
-                
-                print(f"   ✅ CloudWatch {bucket_name}: {size_info['formatted_size']}")
+                    # Tentar obter contagem de objetos
+                    count_metric = cw.get_metric_statistics(
+                        Namespace='AWS/S3',
+                        MetricName='NumberOfObjects',
+                        Dimensions=[
+                            {'Name': 'BucketName', 'Value': bucket_name},
+                            {'Name': 'StorageType', 'Value': 'AllStorageTypes'}
+                        ],
+                        StartTime=datetime.utcnow() - timedelta(days=2),
+                        EndTime=datetime.utcnow(),
+                        Period=86400,
+                        Statistics=['Average']
+                    )
+                    
+                    if count_metric['Datapoints']:
+                        size_info['object_count'] = int(count_metric['Datapoints'][-1]['Average'])
+                    
+                    size_info['formatted_size'] = self.format_bytes(size_bytes)
+                    print(f"   ✅ CloudWatch {bucket_name}: {size_info['formatted_size']}")
+                    return size_info
                     
             except Exception as cw_error:
-                print(f"   ❌ Erro no CloudWatch: {str(cw_error)}")
-                self.log_error('cloudwatch-s3', bucket_region, cw_error)
-                size_info['formatted_size'] = "Erro ao obter tamanho"
+                print(f"   ⚠️ CloudWatch falhou para {bucket_name}: {str(cw_error)[:50]}...")
+                pass
             
+            # Estratégia 2: Listagem direta com limite e timeout
+            def list_objects_limited():
+                s3 = self.create_client('s3')
+                paginator = s3.get_paginator('list_objects_v2')
+                
+                total_size = 0
+                total_count = 0
+                
+                print(f"   📋 Listando objetos (máx: {self.max_s3_objects})...")
+                
+                for page in paginator.paginate(Bucket=bucket_name):
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            total_size += obj['Size']
+                            total_count += 1
+                            
+                            # Parar se atingir o limite
+                            if total_count >= self.max_s3_objects:
+                                print(f"   ⚠️ Limite de {self.max_s3_objects} objetos atingido")
+                                return total_size, total_count, True
+                
+                return total_size, total_count, False
+            
+            # Executar com timeout de 60 segundos para S3
+            size_bytes, count, limited = self.with_timeout(list_objects_limited, 60)
+            
+            size_info['size_bytes'] = size_bytes
+            size_info['object_count'] = count
+            size_info['method_used'] = 'direct_limited' if limited else 'direct_full'
+            
+            if limited:
+                size_info['formatted_size'] = f"{self.format_bytes(size_bytes)} (>{self.max_s3_objects} objs)"
+            else:
+                size_info['formatted_size'] = f"{self.format_bytes(size_bytes)} ({count} objs)"
+            
+            print(f"   ✅ Listagem {bucket_name}: {size_info['formatted_size']}")
+            return size_info
+            
+        except TimeoutError:
+            print(f"   ⏰ Timeout no bucket {bucket_name}")
+            size_info['formatted_size'] = "Timeout na consulta"
+            size_info['method_used'] = 'timeout'
+            self.log_error('s3-timeout', bucket_name, "Timeout na consulta do bucket")
+            
+        except Exception as e:
+            print(f"   ❌ Erro no bucket {bucket_name}: {str(e)[:50]}...")
+            size_info['formatted_size'] = "Erro ao obter tamanho"
+            size_info['method_used'] = 'error'
             self.log_error('s3-bucket-size', bucket_name, e)
         
         return size_info
+    
+    def format_bytes(self, bytes_value):
+        """Formatar bytes para formato legível"""
+        if bytes_value == 0:
+            return "0 B"
+        elif bytes_value < 1024:
+            return f"{bytes_value:.0f} B"
+        elif bytes_value < 1024**2:
+            return f"{bytes_value/1024:.2f} KB"
+        elif bytes_value < 1024**3:
+            return f"{bytes_value/(1024**2):.2f} MB"
+        elif bytes_value < 1024**4:
+            return f"{bytes_value/(1024**3):.2f} GB"
+        else:
+            return f"{bytes_value/(1024**4):.2f} TB"
     
     def list_rds_instances(self):
         """Listar instâncias RDS"""
@@ -350,17 +444,18 @@ class AWSCostInventory:
         return load_balancers
     
     def list_lambda_functions(self):
-        """Listar funções Lambda"""
+        """Listar funções Lambda com timeout"""
         functions = []
         regions = self.get_all_regions()
         
-        for region in regions:
+        def list_lambda_region(region):
+            region_functions = []
             try:
-                lambda_client = boto3.client('lambda', region_name=region)
+                lambda_client = self.create_client('lambda', region)
                 response = lambda_client.list_functions()
                 
                 for func in response['Functions']:
-                    functions.append({
+                    region_functions.append({
                         'Region': region,
                         'FunctionName': func['FunctionName'],
                         'Runtime': func.get('Runtime', 'N/A'),
@@ -371,11 +466,11 @@ class AWSCostInventory:
                         'State': func.get('State', 'N/A'),
                         'FunctionArn': func['FunctionArn']
                     })
-                    
             except Exception as e:
                 self.log_error('lambda', region, e)
+            return region_functions
         
-        return functions
+        return self.process_region_parallel(list_lambda_region, regions, 'Lambda', max_workers=3)
     
     def list_nat_gateways(self):
         """Listar NAT Gateways"""
@@ -384,7 +479,7 @@ class AWSCostInventory:
         
         for region in regions:
             try:
-                ec2 = boto3.client('ec2', region_name=region)
+                ec2 = self.create_client('ec2', region)
                 response = ec2.describe_nat_gateways()
                 
                 for nat in response['NatGateways']:
@@ -405,6 +500,117 @@ class AWSCostInventory:
                 self.log_error('nat-gateway', region, e)
         
         return nat_gateways
+    
+    def process_region_parallel(self, service_func, regions, service_name, max_workers=3):
+        """Processar regiões em paralelo com limite de workers"""
+        all_results = []
+        failed_regions = []
+        
+        print(f"🔄 Processando {service_name} em {len(regions)} regiões (workers: {max_workers})...")
+        
+        def process_single_region(region):
+            try:
+                if region in self.failed_regions:
+                    print(f"   ⏩ Pulando região {region} (falha anterior)")
+                    return []
+                
+                print(f"   🌍 Processando {service_name} em {region}...")
+                result = service_func(region)
+                print(f"   ✅ {region}: {len(result) if isinstance(result, list) else 'OK'}")
+                return result
+            except Exception as e:
+                error_msg = str(e)[:100]
+                print(f"   ❌ {region}: {error_msg}")
+                self.log_error(service_name, region, e)
+                failed_regions.append(region)
+                return []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_region = {executor.submit(process_single_region, region): region 
+                              for region in regions}
+            
+            for future in future_to_region:
+                try:
+                    result = future.result(timeout=self.timeout_seconds * 2)  # Timeout maior para paralelo
+                    if result:
+                        all_results.extend(result if isinstance(result, list) else [result])
+                except TimeoutError:
+                    region = future_to_region[future]
+                    print(f"   ⏰ Timeout em {region}")
+                    failed_regions.append(region)
+                except Exception as e:
+                    region = future_to_region[future]
+                    print(f"   ❌ Erro em {region}: {str(e)[:50]}")
+                    failed_regions.append(region)
+        
+        # Marcar regiões que falharam consistentemente
+        for region in failed_regions:
+            self.failed_regions.add(region)
+        
+        print(f"📊 {service_name}: {len(all_results)} recursos encontrados")
+        if failed_regions:
+            print(f"⚠️ Falhas em {len(failed_regions)} regiões: {failed_regions[:3]}...")
+        
+        return all_results
+    
+    def list_ec2_instances_region(self, region):
+        """Listar instâncias EC2 em uma região específica"""
+        instances = []
+        try:
+            ec2 = self.create_client('ec2', region)
+            response = ec2.describe_instances()
+            
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                    
+                    # Obter volumes de forma mais eficiente
+                    volumes = []
+                    if 'BlockDeviceMappings' in instance:
+                        for mapping in instance['BlockDeviceMappings'][:5]:  # Limitar a 5 volumes
+                            volume_id = mapping.get('Ebs', {}).get('VolumeId')
+                            if volume_id:
+                                try:
+                                    volume_info = ec2.describe_volumes(VolumeIds=[volume_id])
+                                    volume = volume_info['Volumes'][0]
+                                    volumes.append({
+                                        'VolumeId': volume_id,
+                                        'Size': volume['Size'],
+                                        'VolumeType': volume['VolumeType'],
+                                        'Encrypted': volume['Encrypted']
+                                    })
+                                except Exception:
+                                    pass  # Ignorar erros de volume individual
+                    
+                    instances.append({
+                        'Region': region,
+                        'InstanceId': instance['InstanceId'],
+                        'InstanceType': instance['InstanceType'],
+                        'State': instance['State']['Name'],
+                        'LaunchTime': instance.get('LaunchTime', '').isoformat() if instance.get('LaunchTime') else None,
+                        'Platform': instance.get('Platform', 'Linux'),
+                        'VPC': instance.get('VpcId'),
+                        'SubnetId': instance.get('SubnetId'),
+                        'PublicIP': instance.get('PublicIpAddress'),
+                        'PrivateIP': instance.get('PrivateIpAddress'),
+                        'Name': tags.get('Name', 'N/A'),
+                        'Environment': tags.get('Environment', 'N/A'),
+                        'Volumes': volumes
+                    })
+        except Exception as e:
+            self.log_error('ec2', region, e)
+        
+        return instances
+    
+    def list_ec2_instances(self):
+        """Listar instâncias EC2 usando processamento paralelo"""
+        regions = self.get_all_regions()
+        return self.process_region_parallel(
+            self.list_ec2_instances_region, 
+            regions, 
+            'EC2', 
+            max_workers=4
+        )
     
     def list_elastic_ips(self):
         """Listar Elastic IPs"""
@@ -695,44 +901,80 @@ class AWSCostInventory:
         return clusters
 
     def run_inventory(self):
-        """Executar inventário completo"""
-        print("Iniciando inventário COMPLETO de recursos AWS...")
+        """Executar inventário completo com timeouts e progresso"""
+        start_time = time.time()
+        print("🚀 Iniciando inventário COMPLETO de recursos AWS...")
+        print(f"⏱️  Timeout por operação: {self.timeout_seconds}s")
+        print(f"📦 Limite S3 por bucket: {self.max_s3_objects} objetos")
+        print("=" * 60)
         
-        print("Coletando instâncias EC2...")
-        self.inventory['EC2_Instances'] = self.list_ec2_instances()
+        services = [
+            ('EC2_Instances', self.list_ec2_instances, "🖥️  Instâncias EC2"),
+            ('EBS_Volumes', self.list_ebs_volumes, "💾 Volumes EBS"),
+            ('S3_Buckets', self.list_s3_buckets, "🪣 Buckets S3"),
+            ('RDS_Instances', self.list_rds_instances, "🗃️  Instâncias RDS"),
+            ('Load_Balancers', self.list_load_balancers, "⚖️  Load Balancers"),
+            ('Lambda_Functions', self.list_lambda_functions, "⚡ Funções Lambda"),
+            ('NAT_Gateways', self.list_nat_gateways, "🌐 NAT Gateways"),
+            ('Elastic_IPs', self.list_elastic_ips, "🔗 Elastic IPs"),
+            ('CloudFront_Distributions', self.list_cloudfront_distributions, "☁️  CloudFront")
+        ]
         
-        print("Coletando volumes EBS...")
-        self.inventory['EBS_Volumes'] = self.list_ebs_volumes()
+        total_services = len(services)
         
-        print("Coletando buckets S3...")
-        self.inventory['S3_Buckets'] = self.list_s3_buckets()
+        for i, (key, func, description) in enumerate(services, 1):
+            service_start = time.time()
+            print(f"\n[{i}/{total_services}] {description}...")
+            
+            try:
+                # Executar com timeout global
+                result = self.with_timeout(func, self.timeout_seconds * 3)
+                self.inventory[key] = result
+                
+                service_time = time.time() - service_start
+                count = len(result) if isinstance(result, list) else 1
+                print(f"✅ {description}: {count} recursos em {service_time:.1f}s")
+                
+            except TimeoutError:
+                print(f"⏰ TIMEOUT: {description} excedeu {self.timeout_seconds * 3}s")
+                self.inventory[key] = []
+                self.log_error(key.lower(), 'global', 'Timeout global do serviço')
+                
+            except Exception as e:
+                print(f"❌ ERRO: {description} - {str(e)[:100]}...")
+                self.inventory[key] = []
+                self.log_error(key.lower(), 'global', e)
         
-        print("Coletando instâncias RDS...")
-        self.inventory['RDS_Instances'] = self.list_rds_instances()
+        # Recursos adicionais com timeout individual
+        print(f"\n[{total_services + 1}] 🔧 Recursos adicionais...")
+        try:
+            additional = self.with_timeout(self.list_additional_cost_resources, self.timeout_seconds * 5)
+            self.inventory.update(additional)
+            print("✅ Recursos adicionais coletados")
+        except TimeoutError:
+            print(f"⏰ TIMEOUT: Recursos adicionais excederam {self.timeout_seconds * 5}s")
+        except Exception as e:
+            print(f"❌ ERRO: Recursos adicionais - {str(e)[:100]}...")
         
-        print("Coletando Load Balancers...")
-        self.inventory['Load_Balancers'] = self.list_load_balancers()
+        # Finalizar
+        total_time = time.time() - start_time
+        self._add_metadata(total_time)
         
-        print("Coletando funções Lambda...")
-        self.inventory['Lambda_Functions'] = self.list_lambda_functions()
+        print(f"\n🎉 Inventário concluído em {total_time:.1f}s")
+        print(f"⚠️  Total de erros: {len(self.errors)}")
+        print(f"🚫 Regiões com falhas: {len(self.failed_regions)}")
         
-        print("Coletando NAT Gateways...")
-        self.inventory['NAT_Gateways'] = self.list_nat_gateways()
-        
-        print("Coletando Elastic IPs...")
-        self.inventory['Elastic_IPs'] = self.list_elastic_ips()
-        
-        print("Coletando distribuições CloudFront...")
-        self.inventory['CloudFront_Distributions'] = self.list_cloudfront_distributions()
-        
-        # Recursos adicionais
-        additional = self.list_additional_cost_resources()
-        self.inventory.update(additional)
-        
-        # Adicionar timestamp e resumo
+        return self.inventory
+    
+    def _add_metadata(self, total_time):
+        """Adicionar metadados ao inventário"""
         self.inventory['_metadata'] = {
             'generated_at': datetime.utcnow().isoformat(),
+            'execution_time_seconds': round(total_time, 2),
+            'timeout_config': self.timeout_seconds,
+            'max_s3_objects': self.max_s3_objects,
             'total_errors': len(self.errors),
+            'failed_regions': list(self.failed_regions),
             'summary': {
                 'ec2_instances': len(self.inventory.get('EC2_Instances', [])),
                 'ebs_volumes': len(self.inventory.get('EBS_Volumes', [])),
@@ -755,40 +997,96 @@ class AWSCostInventory:
         
         if self.errors:
             self.inventory['_errors'] = self.errors
-        
-        return self.inventory
 
 def main():
     try:
-        # Verificar credenciais AWS
-        sts = boto3.client('sts')
+        print("🔐 Verificando credenciais AWS...")
+        # Verificar credenciais AWS com timeout
+        sts = boto3.client('sts', config=Config(
+            retries={'max_attempts': 3, 'mode': 'adaptive'},
+            read_timeout=15,
+            connect_timeout=15
+        ))
         identity = sts.get_caller_identity()
-        print(f"✅ Credenciais AWS válidas - Account: {identity['Account']}, User: {identity.get('Arn', 'N/A')}")
+        print(f"✅ Credenciais AWS válidas")
+        print(f"   Account: {identity['Account']}")
+        print(f"   User: {identity.get('Arn', 'N/A')}")
         
     except (NoCredentialsError, ClientError) as e:
         print(f"❌ Erro nas credenciais AWS: {e}")
         print("💡 Certifique-se de estar executando no CloudShell ou com credenciais configuradas")
         sys.exit(1)
+    except Exception as e:
+        print(f"⚠️ Erro inesperado na verificação de credenciais: {e}")
+        print("🔄 Continuando mesmo assim...")
     
     # Executar inventário
+    print("\n" + "=" * 60)
     inventory = AWSCostInventory()
+    
+    # Ajustar timeouts baseado no ambiente
+    # CloudShell tem limitações, então usar timeouts mais conservadores
+    if 'AWS_EXECUTION_ENV' in os.environ:
+        print("🌩️  Detectado ambiente CloudShell - usando timeouts conservadores")
+        inventory.timeout_seconds = 20
+        inventory.max_s3_objects = 5000
+    
     results = inventory.run_inventory()
     
     # Salvar resultado
-    output_file = 'aws_cost_inventory.json'
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2, ensure_ascii=False, default=str)
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    output_file = f'aws_cost_inventory_{timestamp}.json'
     
-    print(f"\n✅ Inventário completo salvo em '{output_file}'")
-    print(f"📊 Resumo:")
-    for service, count in results['_metadata']['summary'].items():
-        print(f"   • {service.replace('_', ' ').title()}: {count}")
-    
-    if results.get('_errors'):
-        print(f"⚠️ Total de erros encontrados: {len(results['_errors'])}")
-    
-    print(f"\n📄 Para visualizar o resultado completo:")
-    print(f"   cat {output_file} | jq .")
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False, default=str)
+        
+        print(f"\n💾 Inventário salvo em '{output_file}'")
+        
+        # Mostrar resumo
+        print(f"\n📊 RESUMO DO INVENTÁRIO:")
+        print("=" * 40)
+        metadata = results.get('_metadata', {})
+        summary = metadata.get('summary', {})
+        
+        for service, count in summary.items():
+            if count > 0:
+                service_name = service.replace('_', ' ').title()
+                print(f"   • {service_name}: {count}")
+        
+        print(f"\n⏱️  Tempo total: {metadata.get('execution_time_seconds', 'N/A')}s")
+        
+        if results.get('_errors'):
+            error_count = len(results['_errors'])
+            print(f"⚠️  Erros encontrados: {error_count}")
+            
+            # Mostrar tipos de erro mais comuns
+            error_services = {}
+            for error in results['_errors'][:10]:  # Primeiros 10 erros
+                service = error['service']
+                error_services[service] = error_services.get(service, 0) + 1
+            
+            if error_services:
+                print("   Serviços com mais erros:")
+                for service, count in sorted(error_services.items(), key=lambda x: x[1], reverse=True):
+                    print(f"     - {service}: {count} erros")
+        
+        failed_regions = metadata.get('failed_regions', [])
+        if failed_regions:
+            print(f"🚫 Regiões com falhas: {len(failed_regions)}")
+            if len(failed_regions) <= 5:
+                print(f"   {', '.join(failed_regions)}")
+            else:
+                print(f"   {', '.join(failed_regions[:5])} e mais {len(failed_regions) - 5}...")
+        
+        print(f"\n📄 Para visualizar detalhes:")
+        print(f"   cat {output_file} | jq .")
+        print(f"   ou")
+        print(f"   python -m json.tool {output_file}")
+        
+    except Exception as e:
+        print(f"❌ Erro ao salvar arquivo: {e}")
+        print("📋 Resultado disponível apenas na memória")
 
 if __name__ == "__main__":
     main()
