@@ -1034,8 +1034,7 @@ def main():
     results = inventory.run_inventory()
     
     # Salvar resultado
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    output_file = f'aws_cost_inventory_{timestamp}.json'
+    output_file = f'aws_cost_inventory.json'
     
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
