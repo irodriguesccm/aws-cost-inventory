@@ -15,7 +15,6 @@ class AWSCostInventory:
         self.inventory = {}
         self.errors = []
         self.failed_regions = set()
-        self.max_s3_objects = 10000  # Limite para evitar travamentos
         self.timeout_seconds = 30
         
         # Configuração de timeout para clientes boto3
@@ -181,7 +180,7 @@ class AWSCostInventory:
         return volumes
     
     def list_s3_buckets(self):
-        """Listar buckets S3 com timeouts e otimizações"""
+        """Listar buckets S3 apenas com nome e tamanho total"""
         buckets = []
         try:
             s3 = self.create_client('s3')
@@ -194,7 +193,7 @@ class AWSCostInventory:
                 bucket_name = bucket['Name']
                 print(f" [{i}/{total_buckets}] Analisando bucket: {bucket_name}")
                 
-                # Obter região do bucket com timeout
+                # Obter região do bucket
                 try:
                     bucket_region = s3.get_bucket_location(Bucket=bucket_name)['LocationConstraint']
                     if bucket_region is None:
@@ -203,17 +202,15 @@ class AWSCostInventory:
                     print(f"    Erro ao obter região: {str(e)[:50]}...")
                     bucket_region = 'unknown'
                 
-                # Obter tamanho com timeout e limitações
-                size_info = self.get_bucket_size(bucket_name, bucket_region)
+                # Obter tamanho usando CloudWatch (método mais eficiente)
+                size_info = self.get_bucket_size_simple(bucket_name, bucket_region)
                 
                 buckets.append({
                     'BucketName': bucket_name,
                     'Region': bucket_region,
                     'CreationDate': bucket['CreationDate'].isoformat(),
                     'Size': size_info['formatted_size'],
-                    'ObjectCount': size_info['object_count'],
-                    'SizeBytes': size_info['size_bytes'],
-                    'AnalysisMethod': size_info['method_used']
+                    'SizeBytes': size_info['size_bytes']
                 })
                 
         except Exception as e:
@@ -221,115 +218,47 @@ class AWSCostInventory:
         
         return buckets
 
-    def get_bucket_size(self, bucket_name, bucket_region):
-        """Obter tamanho do bucket com timeout e limite de objetos"""
+    def get_bucket_size_simple(self, bucket_name, bucket_region):
+        """Obter tamanho do bucket usando CloudWatch"""
         size_info = {
             'size_bytes': 0,
-            'object_count': 0,
-            'formatted_size': 'N/A',
-            'method_used': 'none'
+            'formatted_size': 'N/A'
         }
         
         try:
-            print(f"    Analisando bucket {bucket_name} (timeout: {self.timeout_seconds}s)...")
+            # Usar CloudWatch para obter métricas de tamanho
+            cw_region = 'us-east-1' if bucket_region in [None, 'us-east-1'] else bucket_region
+            cw = self.create_client('cloudwatch', cw_region)
             
-            # Estratégia 1: Tentar CloudWatch primeiro (mais rápido)
-            try:
-                cw_region = 'us-east-1' if bucket_region in [None, 'us-east-1'] else bucket_region
-                cw = self.create_client('cloudwatch', cw_region)
-                
-                # Tentar obter métricas dos últimos 2 dias
-                metric = cw.get_metric_statistics(
-                    Namespace='AWS/S3',
-                    MetricName='BucketSizeBytes',
-                    Dimensions=[
-                        {'Name': 'BucketName', 'Value': bucket_name},
-                        {'Name': 'StorageType', 'Value': 'StandardStorage'}
-                    ],
-                    StartTime=datetime.utcnow() - timedelta(days=2),
-                    EndTime=datetime.utcnow(),
-                    Period=86400,
-                    Statistics=['Average']
-                )
-                
-                if metric['Datapoints']:
-                    size_bytes = metric['Datapoints'][-1]['Average']
-                    size_info['size_bytes'] = size_bytes
-                    size_info['method_used'] = 'cloudwatch'
-                    
-                    # Tentar obter contagem de objetos
-                    count_metric = cw.get_metric_statistics(
-                        Namespace='AWS/S3',
-                        MetricName='NumberOfObjects',
-                        Dimensions=[
-                            {'Name': 'BucketName', 'Value': bucket_name},
-                            {'Name': 'StorageType', 'Value': 'AllStorageTypes'}
-                        ],
-                        StartTime=datetime.utcnow() - timedelta(days=2),
-                        EndTime=datetime.utcnow(),
-                        Period=86400,
-                        Statistics=['Average']
-                    )
-                    
-                    if count_metric['Datapoints']:
-                        size_info['object_count'] = int(count_metric['Datapoints'][-1]['Average'])
-                    
-                    size_info['formatted_size'] = self.format_bytes(size_bytes)
-                    print(f"    CloudWatch {bucket_name}: {size_info['formatted_size']}")
-                    return size_info
-                    
-            except Exception as cw_error:
-                print(f"    CloudWatch falhou para {bucket_name}: {str(cw_error)[:50]}...")
-                pass
+            # Obter métricas dos últimos 7 dias
+            metric = cw.get_metric_statistics(
+                Namespace='AWS/S3',
+                MetricName='BucketSizeBytes',
+                Dimensions=[
+                    {'Name': 'BucketName', 'Value': bucket_name},
+                    {'Name': 'StorageType', 'Value': 'StandardStorage'}
+                ],
+                StartTime=datetime.utcnow() - timedelta(days=7),
+                EndTime=datetime.utcnow(),
+                Period=86400,  # 1 dia
+                Statistics=['Average']
+            )
             
-            # Estratégia 2: Listagem direta com limite e timeout
-            def list_objects_limited():
-                s3 = self.create_client('s3')
-                paginator = s3.get_paginator('list_objects_v2')
-                
-                total_size = 0
-                total_count = 0
-                
-                print(f"    Listando objetos (máx: {self.max_s3_objects})...")
-                
-                for page in paginator.paginate(Bucket=bucket_name):
-                    if 'Contents' in page:
-                        for obj in page['Contents']:
-                            total_size += obj['Size']
-                            total_count += 1
-                            
-                            # Parar se atingir o limite
-                            if total_count >= self.max_s3_objects:
-                                print(f"    Limite de {self.max_s3_objects} objetos atingido")
-                                return total_size, total_count, True
-                
-                return total_size, total_count, False
-            
-            # Executar com timeout de 60 segundos para S3
-            size_bytes, count, limited = self.with_timeout(list_objects_limited, 60)
-            
-            size_info['size_bytes'] = size_bytes
-            size_info['object_count'] = count
-            size_info['method_used'] = 'direct_limited' if limited else 'direct_full'
-            
-            if limited:
-                size_info['formatted_size'] = f"{self.format_bytes(size_bytes)} (>{self.max_s3_objects} objs)"
+            if metric['Datapoints']:
+                # Pegar o valor mais recente
+                latest_data = sorted(metric['Datapoints'], key=lambda x: x['Timestamp'])[-1]
+                size_bytes = latest_data['Average']
+                size_info['size_bytes'] = size_bytes
+                size_info['formatted_size'] = self.format_bytes(size_bytes)
+                print(f"    {bucket_name}: {size_info['formatted_size']}")
             else:
-                size_info['formatted_size'] = f"{self.format_bytes(size_bytes)} ({count} objs)"
-            
-            print(f"    Listagem {bucket_name}: {size_info['formatted_size']}")
-            return size_info
-            
-        except TimeoutError:
-            print(f"    Timeout no bucket {bucket_name}")
-            size_info['formatted_size'] = "Timeout na consulta"
-            size_info['method_used'] = 'timeout'
-            self.log_error('s3-timeout', bucket_name, "Timeout na consulta do bucket")
-            
+                # Se não há dados no CloudWatch, bucket pode estar vazio ou ser muito novo
+                size_info['formatted_size'] = "0 B (sem dados)"
+                print(f"    {bucket_name}: sem dados de métricas")
+                
         except Exception as e:
-            print(f"    Erro no bucket {bucket_name}: {str(e)[:50]}...")
-            size_info['formatted_size'] = "Erro ao obter tamanho"
-            size_info['method_used'] = 'error'
+            print(f"    Erro ao obter tamanho do {bucket_name}: {str(e)[:50]}...")
+            size_info['formatted_size'] = "Erro na consulta"
             self.log_error('s3-bucket-size', bucket_name, e)
         
         return size_info
