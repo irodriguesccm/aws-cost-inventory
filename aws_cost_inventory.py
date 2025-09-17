@@ -350,7 +350,7 @@ class AWSCostInventory:
             return f"{bytes_value/(1024**4):.2f} TB"
     
     def list_rds_instances(self):
-        """Listar instâncias RDS"""
+        """Listar instâncias RDS com detalhamento completo de clusters Aurora"""
         rds_instances = []
         regions = self.get_all_regions()
         
@@ -358,41 +358,119 @@ class AWSCostInventory:
             try:
                 rds = boto3.client('rds', region_name=region)
                 
-                # RDS Instances
+                # RDS Instances standalone
                 instances = rds.describe_db_instances()
                 for instance in instances['DBInstances']:
-                    rds_instances.append({
-                        'Region': region,
-                        'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
-                        'DBInstanceClass': instance['DBInstanceClass'],
-                        'Engine': instance['Engine'],
-                        'EngineVersion': instance['EngineVersion'],
-                        'DBInstanceStatus': instance['DBInstanceStatus'],
-                        'AllocatedStorage': instance['AllocatedStorage'],
-                        'StorageType': instance.get('StorageType', 'N/A'),
-                        'MultiAZ': instance['MultiAZ'],
-                        'PubliclyAccessible': instance['PubliclyAccessible'],
-                        'AvailabilityZone': instance.get('AvailabilityZone', 'N/A'),
-                        'VpcId': instance.get('DbSubnetGroup', {}).get('VpcId', 'N/A')
-                    })
+                    # Verifica se não é parte de um cluster Aurora
+                    if not instance.get('DBClusterIdentifier'):
+                        rds_instances.append({
+                            'Region': region,
+                            'Type': 'RDS Instance',
+                            'DBInstanceIdentifier': instance['DBInstanceIdentifier'],
+                            'DBInstanceClass': instance['DBInstanceClass'],
+                            'Engine': instance['Engine'],
+                            'EngineVersion': instance['EngineVersion'],
+                            'DBInstanceStatus': instance['DBInstanceStatus'],
+                            'AllocatedStorage': instance.get('AllocatedStorage', 0),
+                            'StorageType': instance.get('StorageType', 'N/A'),
+                            'StorageEncrypted': instance.get('StorageEncrypted', False),
+                            'MultiAZ': instance['MultiAZ'],
+                            'PubliclyAccessible': instance['PubliclyAccessible'],
+                            'AvailabilityZone': instance.get('AvailabilityZone', 'N/A'),
+                            'VpcId': instance.get('DbSubnetGroup', {}).get('VpcId', 'N/A'),
+                            'SubnetGroupName': instance.get('DbSubnetGroup', {}).get('DBSubnetGroupName', 'N/A'),
+                            'BackupRetentionPeriod': instance.get('BackupRetentionPeriod', 0),
+                            'MonitoringInterval': instance.get('MonitoringInterval', 0),
+                            'PerformanceInsightsEnabled': instance.get('PerformanceInsightsEnabled', False),
+                            'DeletionProtection': instance.get('DeletionProtection', False)
+                        })
                     
-                # RDS Clusters (Aurora)
+                # RDS Clusters (Aurora) com detalhamento completo
                 try:
                     clusters = rds.describe_db_clusters()
                     for cluster in clusters['DBClusters']:
+                        # Obter detalhes das instâncias do cluster
+                        cluster_instances = []
+                        cluster_members = cluster.get('DBClusterMembers', [])
+                        
+                        # Buscar informações detalhadas de cada instância do cluster
+                        for member in cluster_members:
+                            instance_id = member['DBInstanceIdentifier']
+                            try:
+                                instance_detail = rds.describe_db_instances(DBInstanceIdentifier=instance_id)
+                                instance_info = instance_detail['DBInstances'][0]
+                                
+                                cluster_instances.append({
+                                    'DBInstanceIdentifier': instance_id,
+                                    'DBInstanceClass': instance_info['DBInstanceClass'],
+                                    'DBInstanceStatus': instance_info['DBInstanceStatus'],
+                                    'AvailabilityZone': instance_info.get('AvailabilityZone', 'N/A'),
+                                    'IsClusterWriter': member.get('IsClusterWriter', False),
+                                    'PromotionTier': member.get('PromotionTier', 'N/A'),
+                                    'MonitoringInterval': instance_info.get('MonitoringInterval', 0),
+                                    'PerformanceInsightsEnabled': instance_info.get('PerformanceInsightsEnabled', False),
+                                    'PubliclyAccessible': instance_info.get('PubliclyAccessible', False)
+                                })
+                            except Exception as e:
+                                self.log_error(f'rds-cluster-instance-{instance_id}', region, e)
+                                cluster_instances.append({
+                                    'DBInstanceIdentifier': instance_id,
+                                    'IsClusterWriter': member.get('IsClusterWriter', False),
+                                    'PromotionTier': member.get('PromotionTier', 'N/A'),
+                                    'Status': 'Error retrieving details'
+                                })
+                        
+                        # Calcular configurações de capacidade para Serverless
+                        serverless_config = {}
+                        if cluster.get('EngineMode') == 'serverless':
+                            scaling_config = cluster.get('ScalingConfigurationInfo', {})
+                            serverless_config = {
+                                'MinCapacity': scaling_config.get('MinCapacity', 'N/A'),
+                                'MaxCapacity': scaling_config.get('MaxCapacity', 'N/A'),
+                                'AutoPause': scaling_config.get('AutoPause', False),
+                                'SecondsUntilAutoPause': scaling_config.get('SecondsUntilAutoPause', 'N/A')
+                            }
+                        
+                        # Informações de storage do cluster
+                        storage_info = {
+                            'StorageEncrypted': cluster.get('StorageEncrypted', False),
+                            'KmsKeyId': cluster.get('KmsKeyId', 'N/A') if cluster.get('StorageEncrypted') else 'N/A',
+                            'AllocatedStorage': cluster.get('AllocatedStorage', 0),
+                            'StorageType': cluster.get('StorageType', 'Aurora')
+                        }
+                        
                         rds_instances.append({
                             'Region': region,
+                            'Type': 'Aurora Cluster',
                             'DBClusterIdentifier': cluster['DBClusterIdentifier'],
                             'Engine': cluster['Engine'],
                             'EngineVersion': cluster['EngineVersion'],
+                            'EngineMode': cluster.get('EngineMode', 'provisioned'),
                             'Status': cluster['Status'],
                             'DatabaseName': cluster.get('DatabaseName', 'N/A'),
                             'MasterUsername': cluster['MasterUsername'],
-                            'ClusterMembers': len(cluster.get('DBClusterMembers', [])),
-                            'Type': 'Aurora Cluster'
+                            'Port': cluster.get('Port', 'N/A'),
+                            'Endpoint': cluster.get('Endpoint', 'N/A'),
+                            'ReaderEndpoint': cluster.get('ReaderEndpoint', 'N/A'),
+                            'MultiAZ': cluster.get('MultiAZ', False),
+                            'VpcId': cluster.get('DbSubnetGroup', {}).get('VpcId', 'N/A'),
+                            'SubnetGroupName': cluster.get('DbSubnetGroup', {}).get('DBSubnetGroupName', 'N/A'),
+                            'BackupRetentionPeriod': cluster.get('BackupRetentionPeriod', 0),
+                            'PreferredBackupWindow': cluster.get('PreferredBackupWindow', 'N/A'),
+                            'PreferredMaintenanceWindow': cluster.get('PreferredMaintenanceWindow', 'N/A'),
+                            'DeletionProtection': cluster.get('DeletionProtection', False),
+                            'HttpEndpointEnabled': cluster.get('HttpEndpointEnabled', False),
+                            'ClusterMembers': len(cluster_members),
+                            'ClusterInstances': cluster_instances,
+                            'ServerlessConfig': serverless_config,
+                            'StorageInfo': storage_info,
+                            'AvailabilityZones': list(set([inst.get('AvailabilityZone', 'N/A') for inst in cluster_instances if inst.get('AvailabilityZone') != 'N/A'])),
+                            'TotalInstanceClasses': list(set([inst.get('DBInstanceClass', 'N/A') for inst in cluster_instances if inst.get('DBInstanceClass') != 'N/A'])),
+                            'WriterInstances': len([inst for inst in cluster_instances if inst.get('IsClusterWriter', False)]),
+                            'ReaderInstances': len([inst for inst in cluster_instances if not inst.get('IsClusterWriter', False)])
                         })
-                except:
-                    pass  # Região pode não suportar Aurora
+                except Exception as e:
+                    self.log_error('rds-clusters', region, e)
                     
             except Exception as e:
                 self.log_error('rds', region, e)
