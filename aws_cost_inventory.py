@@ -670,6 +670,69 @@ class AWSCostInventory:
             self.log_error('cloudfront', 'global', e)
         
         return distributions
+
+    def list_data_transfer_out(self, days=30):
+        """Consultar outbound (NetworkOut) em GB via CloudWatch"""
+        outbound = []
+        regions = self.get_all_regions()
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(days=days)
+
+        for region in regions:
+            try:
+                cw = self.create_client('cloudwatch', region)
+
+                metrics = cw.get_metric_statistics(
+                    Namespace='AWS/EC2',
+                    MetricName='NetworkOut',
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=86400,  # 1 dia
+                    Statistics=['Sum']
+                )
+
+                total_bytes = sum(dp['Sum'] for dp in metrics.get('Datapoints', []))
+                total_gb = round(total_bytes / (1024 ** 3), 2)
+
+                outbound.append({
+                    'Region': region,
+                    'PeriodDays': days,
+                    'OutboundGB': total_gb
+                })
+
+            except Exception as e:
+                self.log_error('network-out', region, e)
+
+        return outbound
+    
+    def list_fsx_filesystems(self):
+        """Listar file systems Amazon FSx"""
+        filesystems = []
+        regions = self.get_all_regions()
+
+        for region in regions:
+            try:
+                fsx = boto3.client('fsx', region_name=region)
+                response = fsx.describe_file_systems()
+
+                for fs in response['FileSystems']:
+                    filesystems.append({
+                        'Region': region,
+                        'FileSystemId': fs['FileSystemId'],
+                        'FileSystemType': fs['FileSystemType'],
+                        'StorageCapacityGB': fs.get('StorageCapacity', 0),
+                        'DeploymentType': fs.get('DeploymentType', 'N/A'),
+                        'ThroughputCapacity': fs.get('ThroughputCapacity', 'N/A'),
+                        'Lifecycle': fs.get('Lifecycle', 'N/A'),
+                        'VpcId': fs.get('VpcId', 'N/A'),
+                        'SubnetIds': fs.get('SubnetIds', []),
+                        'CreationTime': fs['CreationTime'].isoformat()
+                    })
+
+            except Exception as e:
+                self.log_error('fsx', region, e)
+
+        return filesystems
     
     def list_additional_cost_resources(self):
         """Listar recursos adicionais que geram custos"""
@@ -702,6 +765,10 @@ class AWSCostInventory:
         # EKS
         print("Coletando clusters EKS...")
         additional_resources['EKS_Clusters'] = self.list_eks_clusters()
+
+        # FSx
+        print("Coletando sistemas FSx...")
+        additional_resources['FSx_FileSystems'] = self.list_fsx_filesystems()
         
         return additional_resources
 
@@ -924,7 +991,8 @@ class AWSCostInventory:
             ('Lambda_Functions', self.list_lambda_functions, " Funções Lambda"),
             ('NAT_Gateways', self.list_nat_gateways, " NAT Gateways"),
             ('Elastic_IPs', self.list_elastic_ips, " Elastic IPs"),
-            ('CloudFront_Distributions', self.list_cloudfront_distributions, "  CloudFront")
+            ('CloudFront_Distributions', self.list_cloudfront_distributions, "  CloudFront"),
+            ('Outbound_Data_Transfer', self.list_data_transfer_out, "  Outbound (Data Transfer Out)")
         ]
         
         total_services = len(services)
@@ -998,7 +1066,8 @@ class AWSCostInventory:
                 'opensearch_domains': len(self.inventory.get('OpenSearch_Domains', [])),
                 'api_gateways': len(self.inventory.get('API_Gateways', [])),
                 'ecs_clusters': len(self.inventory.get('ECS_Clusters', [])),
-                'eks_clusters': len(self.inventory.get('EKS_Clusters', []))
+                'eks_clusters': len(self.inventory.get('EKS_Clusters', [])),
+                'fsx_filesystems': len(self.inventory.get('FSx_FileSystems', [])),
             }
         }
         
