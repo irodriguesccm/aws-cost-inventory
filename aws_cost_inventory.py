@@ -671,37 +671,61 @@ class AWSCostInventory:
         
         return distributions
 
-    def list_data_transfer_out(self, days=30):
-        """Consultar outbound (NetworkOut) em GB via CloudWatch"""
+    def list_data_transfer_out(self):
+        """
+        Consultar Data Transfer Out (Outbound) em GB usando Cost Explorer
+        Retorna TODAS as regiões, preenchendo com 0 onde não houve consumo
+        """
         outbound = []
+
+        # Todas as regiões AWS
         regions = self.get_all_regions()
-        end_time = datetime.utcnow()
-        start_time = end_time - timedelta(days=days)
 
-        for region in regions:
-            try:
-                cw = self.create_client('cloudwatch', region)
+        # Cost Explorer é global (us-east-1)
+        ce = boto3.client('ce', region_name='us-east-1')
 
-                metrics = cw.get_metric_statistics(
-                    Namespace='AWS/EC2',
-                    MetricName='NetworkOut',
-                    StartTime=start_time,
-                    EndTime=end_time,
-                    Period=86400,  # 1 dia
-                    Statistics=['Sum']
-                )
+        # Último mês completo
+        end_date = datetime.utcnow().replace(day=1)
+        start_date = (end_date - timedelta(days=1)).replace(day=1)
 
-                total_bytes = sum(dp['Sum'] for dp in metrics.get('Datapoints', []))
-                total_gb = round(total_bytes / (1024 ** 3), 2)
+        try:
+            response = ce.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_date.strftime('%Y-%m-%d'),
+                    'End': end_date.strftime('%Y-%m-%d')
+                },
+                Granularity='MONTHLY',
+                Metrics=['UsageQuantity'],
+                Filter={
+                    'Dimensions': {
+                        'Key': 'USAGE_TYPE',
+                        'Values': ['DataTransfer-Out-Bytes']
+                    }
+                },
+                GroupBy=[
+                    {
+                        'Type': 'DIMENSION',
+                        'Key': 'REGION'
+                    }
+                ]
+            )
 
+            # Mapear consumo retornado pelo Cost Explorer
+            ce_usage = {}
+            for group in response['ResultsByTime'][0].get('Groups', []):
+                region = group['Keys'][0]
+                amount = float(group['Metrics']['UsageQuantity']['Amount'])
+                ce_usage[region] = round(amount, 4)
+
+            # Garantir TODAS as regiões
+            for region in regions:
                 outbound.append({
                     'Region': region,
-                    'PeriodDays': days,
-                    'OutboundGB': total_gb
+                    'OutboundGB': ce_usage.get(region, 0)
                 })
 
-            except Exception as e:
-                self.log_error('network-out', region, e)
+        except Exception as e:
+            self.log_error('cost-explorer-outbound', 'global', e)
 
         return outbound
     
@@ -992,7 +1016,7 @@ class AWSCostInventory:
             ('NAT_Gateways', self.list_nat_gateways, " NAT Gateways"),
             ('Elastic_IPs', self.list_elastic_ips, " Elastic IPs"),
             ('CloudFront_Distributions', self.list_cloudfront_distributions, "  CloudFront"),
-            ('Outbound_Data_Transfer', self.list_data_transfer_out, "  Outbound (Data Transfer Out)")
+            ('Outbound_Data_Transfer', self.list_data_transfer_out, "  Outbound (Data Transfer)")
         ]
         
         total_services = len(services)
