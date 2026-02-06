@@ -809,28 +809,62 @@ class AWSCostInventory:
         return breakdown
     
     def list_fsx_filesystems(self):
-        """Listar file systems Amazon FSx"""
+        """Listar file systems Amazon FSx e detalhar volumes ONTAP"""
         filesystems = []
         regions = self.get_all_regions()
 
         for region in regions:
             try:
-                fsx = boto3.client('fsx', region_name=region)
+                # Usar create_client para respeitar timeouts configurados na classe
+                fsx = self.create_client('fsx', region_name=region)
                 response = fsx.describe_file_systems()
 
                 for fs in response['FileSystems']:
-                    filesystems.append({
+                    fs_id = fs['FileSystemId']
+                    fs_type = fs['FileSystemType']
+                    
+                    # Objeto base do File System
+                    fs_data = {
                         'Region': region,
-                        'FileSystemId': fs['FileSystemId'],
-                        'FileSystemType': fs['FileSystemType'],
+                        'FileSystemId': fs_id,
+                        'FileSystemType': fs_type,
                         'StorageCapacityGB': fs.get('StorageCapacity', 0),
                         'DeploymentType': fs.get('DeploymentType', 'N/A'),
                         'ThroughputCapacity': fs.get('ThroughputCapacity', 'N/A'),
                         'Lifecycle': fs.get('Lifecycle', 'N/A'),
                         'VpcId': fs.get('VpcId', 'N/A'),
                         'SubnetIds': fs.get('SubnetIds', []),
-                        'CreationTime': fs['CreationTime'].isoformat()
-                    })
+                        'CreationTime': fs['CreationTime'].isoformat(),
+                        'Volumes': [] # Lista vazia para receber os volumes
+                    }
+
+                    # Lógica específica para ONTAP: Buscar Volumes
+                    if fs_type == 'ONTAP':
+                        try:
+                            volumes_response = fsx.describe_volumes(
+                                Filters=[{'Name': 'file-system-id', 'Values': [fs_id]}]
+                            )
+                            
+                            for vol in volumes_response.get('Volumes', []):
+                                # Tamanho no ONTAP vem em MB, converter para GB
+                                size_mb = vol.get('OntapConfiguration', {}).get('SizeInMegabytes', 0)
+                                size_gb = size_mb / 1024 if size_mb else 0
+                                
+                                fs_data['Volumes'].append({
+                                    'VolumeId': vol['VolumeId'],
+                                    'Name': vol.get('Name', 'N/A'),
+                                    'VolumeType': vol.get('VolumeType', 'N/A'), # RW ou DP (Data Protection)
+                                    'SizeGB': round(size_gb, 2),
+                                    'State': vol.get('Lifecycle', 'N/A'),
+                                    'JunctionPath': vol.get('OntapConfiguration', {}).get('JunctionPath', 'N/A'),
+                                    'CreatedTime': vol['CreationTime'].isoformat()
+                                })
+                        except Exception as e:
+                            # Loga erro específico de volume mas não quebra o inventário do FS
+                            self.log_error(f'fsx-ontap-volumes-{fs_id}', region, e)
+                            fs_data['Volumes_Error'] = "Falha ao listar volumes"
+
+                    filesystems.append(fs_data)
 
             except Exception as e:
                 self.log_error('fsx', region, e)
