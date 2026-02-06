@@ -1097,7 +1097,7 @@ class AWSCostInventory:
             ('CloudFront_Distributions', self.list_cloudfront_distributions, "  CloudFront"),
             ('Outbound_Data_Transfer', self.list_data_transfer_out, "  Outbound (Data Transfer)"),
             ('Billing_Summary', self.get_billing_summary_last_6_months, "  Billing Summary (6 meses)"),
-            ('Cost_Breakdown_90d', self.get_cost_breakdown_last_60_days, "  Cost Breakdown (90 dias)")
+            ('Cost_Breakdown_90d', self.get_cost_breakdown_last_90_days, "  Cost Breakdown (90 dias)")
         ]
         
         total_services = len(services)
