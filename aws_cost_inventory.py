@@ -728,6 +728,85 @@ class AWSCostInventory:
             self.log_error('cost-explorer-outbound', 'global', e)
 
         return outbound
+
+    def get_billing_summary_last_6_months(self):
+        """
+        Retorna o resumo de billing dos últimos 6 meses
+        """
+        ce = boto3.client('ce', region_name='us-east-1')
+        summary = []
+
+        # Período: últimos 6 meses completos
+        end_date = datetime.utcnow().replace(day=1)
+        start_date = (end_date - timedelta(days=180)).replace(day=1)
+
+        try:
+            response = ce.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_date.strftime('%Y-%m-%d'),
+                    'End': end_date.strftime('%Y-%m-%d')
+                },
+                Granularity='MONTHLY',
+                Metrics=['UnblendedCost']
+            )
+
+            for item in response['ResultsByTime']:
+                month = item['TimePeriod']['Start']
+                amount = float(item['Total']['UnblendedCost']['Amount'])
+
+                summary.append({
+                    'Month': month,
+                    'TotalUSD': round(amount, 2)
+                })
+
+        except Exception as e:
+            self.log_error('billing-summary', 'global', e)
+
+        return summary
+    
+    def get_cost_breakdown_last_60_days(self):
+        """
+        Retorna o custo por serviço dos últimos 60 dias
+        """
+        ce = boto3.client('ce', region_name='us-east-1')
+        breakdown = []
+
+        start_date = (datetime.utcnow() - timedelta(days=60)).strftime('%Y-%m-%d')
+        end_date = datetime.utcnow().strftime('%Y-%m-%d')
+
+        try:
+            response = ce.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_date,
+                    'End': end_date
+                },
+                Granularity='MONTHLY',
+                Metrics=['UnblendedCost'],
+                GroupBy=[
+                    {
+                        'Type': 'DIMENSION',
+                        'Key': 'SERVICE'
+                    }
+                ]
+            )
+
+            for group in response['ResultsByTime'][0].get('Groups', []):
+                service = group['Keys'][0]
+                amount = float(group['Metrics']['UnblendedCost']['Amount'])
+
+                if amount > 0:
+                    breakdown.append({
+                        'Service': service,
+                        'CostUSD': round(amount, 2)
+                    })
+
+            # Ordenar por custo desc
+            breakdown.sort(key=lambda x: x['CostUSD'], reverse=True)
+
+        except Exception as e:
+            self.log_error('cost-breakdown-60d', 'global', e)
+
+        return breakdown
     
     def list_fsx_filesystems(self):
         """Listar file systems Amazon FSx"""
@@ -1016,7 +1095,9 @@ class AWSCostInventory:
             ('NAT_Gateways', self.list_nat_gateways, " NAT Gateways"),
             ('Elastic_IPs', self.list_elastic_ips, " Elastic IPs"),
             ('CloudFront_Distributions', self.list_cloudfront_distributions, "  CloudFront"),
-            ('Outbound_Data_Transfer', self.list_data_transfer_out, "  Outbound (Data Transfer)")
+            ('Outbound_Data_Transfer', self.list_data_transfer_out, "  Outbound (Data Transfer)"),
+            ('Billing_Summary', self.get_billing_summary_last_6_months, "  Billing Summary (6 meses)"),
+            ('Cost_Breakdown_60d', self.get_cost_breakdown_last_60_days, "  Cost Breakdown (60 dias)")
         ]
         
         total_services = len(services)
