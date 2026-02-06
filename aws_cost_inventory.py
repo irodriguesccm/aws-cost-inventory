@@ -764,14 +764,14 @@ class AWSCostInventory:
 
         return summary
     
-    def get_cost_breakdown_last_60_days(self):
+    def get_cost_breakdown_last_90_days(self):
         """
-        Retorna o custo por serviço dos últimos 60 dias
+        Retorna o custo por serviço dos últimos 90 dias
         """
         ce = boto3.client('ce', region_name='us-east-1')
         breakdown = []
 
-        start_date = (datetime.utcnow() - timedelta(days=60)).strftime('%Y-%m-%d')
+        start_date = (datetime.utcnow() - timedelta(days=90)).strftime('%Y-%m-%d')
         end_date = datetime.utcnow().strftime('%Y-%m-%d')
 
         try:
@@ -804,7 +804,7 @@ class AWSCostInventory:
             breakdown.sort(key=lambda x: x['CostUSD'], reverse=True)
 
         except Exception as e:
-            self.log_error('cost-breakdown-60d', 'global', e)
+            self.log_error('cost-breakdown-90d', 'global', e)
 
         return breakdown
     
@@ -1097,7 +1097,7 @@ class AWSCostInventory:
             ('CloudFront_Distributions', self.list_cloudfront_distributions, "  CloudFront"),
             ('Outbound_Data_Transfer', self.list_data_transfer_out, "  Outbound (Data Transfer)"),
             ('Billing_Summary', self.get_billing_summary_last_6_months, "  Billing Summary (6 meses)"),
-            ('Cost_Breakdown_60d', self.get_cost_breakdown_last_60_days, "  Cost Breakdown (60 dias)")
+            ('Cost_Breakdown_90d', self.get_cost_breakdown_last_60_days, "  Cost Breakdown (90 dias)")
         ]
         
         total_services = len(services)
