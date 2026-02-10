@@ -561,52 +561,60 @@ class AWSCostInventory:
         return all_results
     
     def list_ec2_instances_region(self, region):
-        """Listar instâncias EC2 em uma região específica"""
+        """Listar TODAS as instâncias EC2 em uma região específica, sem limitação"""
         instances = []
+
         try:
             ec2 = self.create_client('ec2', region)
-            response = ec2.describe_instances()
-            
-            for reservation in response['Reservations']:
-                for instance in reservation['Instances']:
-                    tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
-                    
-                    # Obter volumes de forma mais eficiente
-                    volumes = []
-                    if 'BlockDeviceMappings' in instance:
-                        for mapping in instance['BlockDeviceMappings'][:5]:  # Limitar a 5 volumes
-                            volume_id = mapping.get('Ebs', {}).get('VolumeId')
-                            if volume_id:
-                                try:
-                                    volume_info = ec2.describe_volumes(VolumeIds=[volume_id])
-                                    volume = volume_info['Volumes'][0]
+
+            paginator = ec2.get_paginator('describe_instances')
+
+            for page in paginator.paginate():
+                for reservation in page.get('Reservations', []):
+                    for instance in reservation.get('Instances', []):
+
+                        tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+
+                        # Coletar TODOS os volumes anexados
+                        volume_ids = [
+                            mapping.get('Ebs', {}).get('VolumeId')
+                            for mapping in instance.get('BlockDeviceMappings', [])
+                            if mapping.get('Ebs')
+                        ]
+
+                        volumes = []
+                        if volume_ids:
+                            try:
+                                volume_response = ec2.describe_volumes(VolumeIds=volume_ids)
+                                for volume in volume_response.get('Volumes', []):
                                     volumes.append({
-                                        'VolumeId': volume_id,
+                                        'VolumeId': volume['VolumeId'],
                                         'Size': volume['Size'],
                                         'VolumeType': volume['VolumeType'],
                                         'Encrypted': volume['Encrypted']
                                     })
-                                except Exception:
-                                    pass  # Ignorar erros de volume individual
-                    
-                    instances.append({
-                        'Region': region,
-                        'InstanceId': instance['InstanceId'],
-                        'InstanceType': instance['InstanceType'],
-                        'State': instance['State']['Name'],
-                        'LaunchTime': instance.get('LaunchTime', '').isoformat() if instance.get('LaunchTime') else None,
-                        'Platform': instance.get('Platform', 'Linux'),
-                        'VPC': instance.get('VpcId'),
-                        'SubnetId': instance.get('SubnetId'),
-                        'PublicIP': instance.get('PublicIpAddress'),
-                        'PrivateIP': instance.get('PrivateIpAddress'),
-                        'Name': tags.get('Name', 'N/A'),
-                        'Environment': tags.get('Environment', 'N/A'),
-                        'Volumes': volumes
-                    })
+                            except Exception as e:
+                                self.log_error('ec2-volumes', region, e)
+
+                        instances.append({
+                            'Region': region,
+                            'InstanceId': instance['InstanceId'],
+                            'InstanceType': instance['InstanceType'],
+                            'State': instance['State']['Name'],
+                            'LaunchTime': instance.get('LaunchTime').isoformat() if instance.get('LaunchTime') else None,
+                            'Platform': instance.get('Platform', 'Linux'),
+                            'VPC': instance.get('VpcId'),
+                            'SubnetId': instance.get('SubnetId'),
+                            'PublicIP': instance.get('PublicIpAddress'),
+                            'PrivateIP': instance.get('PrivateIpAddress'),
+                            'Name': tags.get('Name', 'N/A'),
+                            'Environment': tags.get('Environment', 'N/A'),
+                            'Volumes': volumes
+                        })
+
         except Exception as e:
             self.log_error('ec2', region, e)
-        
+
         return instances
     
     def list_ec2_instances(self):
